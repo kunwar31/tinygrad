@@ -82,7 +82,7 @@ class CStyleLanguage(NamedTuple):
     prg = ''.join([f"{self.kernel_prefix} void {function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
-    if self.half_prekernel and any(dtype == dtypes.float16 for _,dtype in bufs): prg = ''.join([f"{self.half_prekernel}", "\n", prg])
+    if self.half_prekernel: prg = ''.join([f"{self.half_prekernel}", "\n", prg])
 
     return prg, global_size[::-1], local_size[::-1]
 
