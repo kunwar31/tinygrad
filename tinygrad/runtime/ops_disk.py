@@ -11,8 +11,9 @@ class RawDiskBuffer(RawBufferMapped):
     self.shape = (size, ) if shape is None else shape
     self.offset = offset  # this is an offset in bytes
     assert device is not None or buf is not None, "disk tensor needs a path or a buf"
+    device = device+getpass.getuser()
     if device is not None:
-      f = open(device+getpass.getuser(), "a+b")
+      f = open(device, "a+b")
       if os.path.getsize(device) < size * dtype.itemsize: os.ftruncate(f.fileno(), size * dtype.itemsize)
       buf = [f, mmap.mmap(f.fileno(), size * dtype.itemsize), 1]
     else:
