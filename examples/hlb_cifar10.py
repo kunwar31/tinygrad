@@ -69,7 +69,7 @@ def whitening(X, kernel_size=hyp['net']['kernel_size']):
 
 class BatchNorm(nn.BatchNorm2d):
   def __init__(self, num_features):
-    super().__init__(num_features, track_running_stats=False, eps=1e-7, momentum=hyp['net']['batch_norm_momentum'], affine=True)
+    super().__init__(num_features, track_running_stats=False, eps=1e-12, momentum=hyp['net']['batch_norm_momentum'], affine=True)
     self.weight.requires_grad = False
     self.bias.requires_grad = True
 
