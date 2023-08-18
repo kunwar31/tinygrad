@@ -11,12 +11,14 @@ from tinygrad.state import get_state_dict
 from tinygrad.nn import optim
 from tinygrad.lazy import Device
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, dtypes
 from tinygrad.ops import GlobalCounters
 from extra.lr_scheduler import OneCycleLR
 from tinygrad.jit import TinyJit
 
 BS, EVAL_BS, STEPS = getenv("BS", 512), getenv('EVAL_BS', 500), getenv("STEPS", 1000)
+
+Tensor.default_type = dtypes.float16
 
 # hyper-parameters were exactly the same as the original repo
 bias_scaler = 56
@@ -29,7 +31,7 @@ hyp = {
     'momentum':       0.85,
     'percent_start':  0.25,
     'scaling_factor': 1./9,
-    'loss_scale_scaler': 1./512,    # (range: ~1/512 - 16+) was 1/128 from original repo w/ FP16
+    'loss_scale_scaler': 1./128,    # (range: ~1/512 - 16+) was 1/128 from original repo w/ FP16
   },
   'net': {
       'kernel_size': 2,             # kernel size for the whitening layer
@@ -62,8 +64,8 @@ def whitening(X, kernel_size=hyp['net']['kernel_size']):
     return np.flip(Λ, 0), np.flip(V.T.reshape(c*h*w, c, h, w), 0)
 
   Λ, V = _eigens(_patches(X.numpy()))
-
-  return Tensor(V/np.sqrt(Λ+1e-2)[:,None,None,None], requires_grad=False)
+  inp = V/np.sqrt(Λ+1e-2)[:,None,None,None]
+  return Tensor(inp.astype(np.float16), requires_grad=False)
 
 class BatchNorm(nn.BatchNorm2d):
   def __init__(self, num_features):
@@ -140,10 +142,10 @@ def make_square_mask(X, mask_size):
   is_even = int(mask_size % 2 == 0)
   center_max = X.shape[-2]-mask_size//2-is_even
   center_min = mask_size//2-is_even
-  center = Tensor.rand(X.shape[0])*(center_max-center_min)+center_min
+  center = Tensor.rand(X.shape[0], dtype=dtypes.float32)*(center_max-center_min)+center_min
 
-  d_y = Tensor.arange(0, X.shape[-2]).reshape((1,1,X.shape[-2],1))
-  d_x = Tensor.arange(0, X.shape[-1]).reshape((1,1,1,X.shape[-1]))
+  d_y = Tensor.arange(0, X.shape[-2], dtype=dtypes.float32).reshape((1,1,X.shape[-2],1))
+  d_x = Tensor.arange(0, X.shape[-1], dtype=dtypes.float32).reshape((1,1,1,X.shape[-1]))
   d_y = d_y - center.reshape((-1,1,1,1))
   d_x = d_x - center.reshape((-1,1,1,1))
   d_y =(d_y >= -(mask_size / 2)) * (d_y <= mask_size / 2)
@@ -248,7 +250,10 @@ def train_cifar(bs=BS, eval_bs=EVAL_BS, steps=STEPS, seed=32):
   loss_batchsize_scaler = 512/BS
   @TinyJit
   def train_step_jitted(model, optimizer, lr_scheduler, X, Y):
+    X = X.half()
+    Y = Y.half()
     out = model(X)
+    print(out.dtype)
     loss = cross_entropy(out, Y, reduction='none' ,label_smoothing=0.2).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler'])
 
     if not getenv("DISABLE_BACKWARD"):
