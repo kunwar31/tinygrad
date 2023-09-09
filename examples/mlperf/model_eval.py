@@ -43,7 +43,7 @@ def eval_resnet():
       dat = Tensor(x)
     except StopIteration:
       dat = None
-    t = outs.numpy().argmax(axis=1)
+    t = outs.argmax(axis=1).numpy()
     et = time.perf_counter()
     print(f"{(mt-st)*1000:.2f} ms loading data, {(et-mt)*1000:.2f} ms to run model")
     print(t)
@@ -173,7 +173,7 @@ def eval_bert():
   from examples.mlperf.metrics import f1_score
   from transformers import BertTokenizer
 
-  tokenizer = BertTokenizer(str(Path(__file__).parent.parent.parent / "weights/bert_vocab.txt"))
+  tokenizer = BertTokenizer(str(Path(__file__).parents[2] / "weights/bert_vocab.txt"))
 
   c = 0
   f1 = 0.0

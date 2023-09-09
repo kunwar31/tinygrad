@@ -1,11 +1,12 @@
-import subprocess, time, re, hashlib, tempfile, os, functools
+import subprocess, time, re, hashlib, tempfile, functools
+from pathlib import Path
 from typing import Optional
 import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
 from tinygrad.helpers import DEBUG, getenv, colored, fromimport, dtypes
 from tinygrad.ops import Compiled
 from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, LRUAllocator
-from tinygrad.codegen.linearizer import LinearizerOptions
+from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
 
 def pretty_ptx(s):
@@ -66,7 +67,7 @@ class CUDAProgram:
     if DEBUG >= 5: print(pretty_ptx(prg))
     if DEBUG >= 6:
       try:
-        fn = os.path.join(tempfile.gettempdir(), f"tinycuda_{hashlib.md5(prg.encode('utf-8')).hexdigest()}")
+        fn = (Path(tempfile.gettempdir()) / f"tinycuda_{hashlib.md5(prg.encode('utf-8')).hexdigest()}").as_posix()
         with open(fn + ".ptx", "wb") as f: f.write(prg.encode('utf-8'))
         subprocess.run(["ptxas", f"-arch={arch()}", "-o", fn, fn+".ptx"], check=True)
         print(subprocess.check_output(['nvdisasm', fn]).decode('utf-8'))
@@ -78,14 +79,14 @@ class CUDAProgram:
     if wait:
       start, end = cuda.Event(), cuda.Event()
       start.record()
-    self.prg(*[x._buf for x in args], block=tuple(local_size), grid=tuple(global_size))
+    self.prg(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size))
     if wait:
       end.record()
       end.synchronize()
       return start.time_till(end)*1e-3
 
 renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
-  kernel_prefix = "__global__", smem_prefix = "__shared__ ", barrier = "__syncthreads();", float4 = "make_float4",
+  kernel_prefix = "__global__ ", smem_prefix = "__shared__ ", arg_int_prefix = "const int", barrier = "__syncthreads();", float4 = "make_float4",
   gid = [f'blockIdx.{chr(120+i)}' for i in range(3)],
   lid = [f'threadIdx.{chr(120+i)}' for i in range(3)],
   half_prekernel = """

@@ -1,20 +1,25 @@
-from typing import List, Tuple, Any, Optional, cast, DefaultDict, NamedTuple, TypeVar, Dict, Iterator, Union, Sequence, Final
-import itertools, math
+from __future__ import annotations
+from typing import List, Tuple, Any, Optional, cast, DefaultDict, NamedTuple, Dict, Union, Sequence, Final, Set
+import itertools, math, functools
 from collections import defaultdict
 from enum import Enum, auto
 
-from tinygrad.helpers import dedup, colored, ImageDType, DEBUG, prod, dtypes, mnum, DType, all_same, partition, getenv
-from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, UnaryOps
-from tinygrad.lazy import LazyBuffer
-from tinygrad.ops import MovementOps, ReduceOps, BinaryOps, TernaryOps
-from tinygrad.runtime.lib import RawConst, buf_is_kernel_arg
-from tinygrad.shape.shapetracker import ShapeTracker, strides_for_shape, View
-from tinygrad.shape.symbolic import Variable, NumNode, Node, SumNode, MulNode, sym_rename
+from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, DType, partition, prod, PtrDType, all_same, getenv
+from tinygrad.ops import LazyOp, UnaryOps
+from tinygrad.ops import ReduceOps, BinaryOps, TernaryOps
+from tinygrad.runtime.lib import RawConst
+from tinygrad.shape.shapetracker import ShapeTracker
+from tinygrad.shape.symbolic import Variable, NumNode, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode, sym_rename
+from tinygrad.codegen.optimizer import OptimizedKernel
+from tinygrad.codegen.kernel import LocalBuffer
 VariableOrNum = Union[Variable, NumNode, Node]
 
 # bottom ones are asm only
-class UOps(Enum): LOOP = auto(); DEFINE_LOCAL = auto(); DEFINE_GLOBAL = auto(); LOAD = auto(); ALU = auto(); ENDLOOP = auto(); STORE = auto(); CAST = auto(); BARRIER = auto(); WMMA = auto(); \
-                  SPECIAL = auto(); DEFINE_REGISTER = auto(); LABEL = auto(); COND_BRANCH = auto() # noqa: E702
+class UOps(Enum):
+  LOOP = auto(); END = auto(); SPECIAL = auto() # loops can be global, local, or other # noqa: E702
+  DEFINE_GLOBAL = auto(); DEFINE_LOCAL = auto(); DEFINE_ACC = auto() # this defines buffers # noqa: E702
+  LOAD = auto(); STORE = auto(); CONST = auto(); BARRIER = auto() # noqa: E702
+  ALU = auto(); WMMA = auto(); CAST = auto(); GEP = auto() # noqa: E702
 
 def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=False) -> Tuple[Node, Node]:
   idy = (idxy//(4*base_shape[1]))
@@ -36,203 +41,54 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=F
   if DEBUG >= 5: print("to_image_idx", base_shape, idx.min, idx.max, idy.min, idy.max, idx, idy)
   return idx, idy
 
-class LocalBuffer(NamedTuple):
-  name: str
-  size: int
-  dtype: DType = dtypes.float32
-  realized: None = None
-  def __str__(self): return f"localbuffer<{self.name}[{self.size}]>"
-
-class Token(NamedTuple):
-  name: str
-  dtype: DType
-  offset: Optional[int] = None
-  def render(self, with_type=False):
-    if with_type:
-      assert self.offset is None
-      return f"{self.dtype.name} {self.name}"
-    if self.offset is None: return self.name
-    assert self.dtype.is_vector_type, f"{self.dtype} isn't okay with offset {self.offset}"
-    selector = f".{'xyzw'[int(self.offset)]}" if self.offset < 4 else f".s{'0123456789aAbBcCdDeEfF'[int(self.offset)]}"
-    return self.name + selector
-  def __repr__(self): return f"<{self.name}>" if self.offset is None and self.dtype == dtypes.float32 else f"<{self.name}:{self.dtype.name}:{self.offset}>"
-
-# TODO: the next three functions are poorly written
-def get_grouped_vector_idxs(acc:List[Token]) -> Optional[List[int]]:
-  idxs: Optional[List[int]] = []
-  for i,a in enumerate(acc):
-    if idxs is None: break
-    if i in idxs: continue
-    if a.dtype.sz > 1 and a.offset == 0:
-      idxs.append(i)
-      friends: List[int] = []
-      for j,b in enumerate(acc):
-        if len(friends) == 3: break
-        if j in idxs: continue
-        if a.name == b.name and b.dtype.sz > 1 and b.offset == len(friends)+1:
-          friends.append(j)
-      if len(friends) == 3: idxs += friends
-      else: idxs = None
-    else:
-      idxs = None
-  return idxs
-
-def to_vector(x:List[Token]) -> Optional[Token]:
-  if all_same(x): return x[0]
-  if all_same([y.name for y in x]) and all(y.dtype.is_vector_type and y.offset == i for i,y in enumerate(x)):
-    return Token(x[0].name, dtypes.get_vector_type(x[0].dtype, amt=4))
-  return None
-
-def get_grouped_maybe_vector(*values:List[Token], grouping_allowed=True):
-  assert all_same([len(x) for x in values]), f"all values are not the same length {values}"
-  # these use accumulators, we can only fold if the acc is a vector
-  idxs = get_grouped_vector_idxs(values[-1]) if grouping_allowed else None
-  if idxs is not None:
-    new_idxs = []
-    new_values = []
-    for i in range(0, len(idxs), 4):
-      nv = [to_vector([v[j] for j in idxs[i:i+4]]) for v in values]
-      if any(x is None for x in nv): break
-      new_idxs.append(idxs[i:i+4])
-      new_values.append(nv)
-    if len(new_values) == len(idxs)//4:
-      return zip(new_idxs, new_values)
-  return zip([[i] for i in range(len(values[0]))], zip(*values))
-
-# TODO: generic visitor pattern?
-def expand_node(idx:Node) -> List[Node]:
-  if isinstance(idx, Variable): return [idx] if idx.expr is not None else [Variable.num(j) for j in range(idx.min, idx.max+1)]
-  if isinstance(idx, NumNode): return [idx]
-  if isinstance(idx, MulNode): return [x*idx.b for x in expand_node(idx.a)]
-  if isinstance(idx, SumNode): return [Variable.sum(list(it)) for it in itertools.product(*[expand_node(x) for x in idx.nodes])]
-  raise NotImplementedError(idx)
-
-def expand_idxs(idxs:Sequence[Node]) -> Iterator[Tuple[Node, ...]]:
-  for x in itertools.product(*[expand_node(idx) for idx in idxs[::-1]]):
-    yield x[::-1]
-
-class MemOp(NamedTuple):
-  name: str
-  idx: Variable
-  local: bool
-  memory_dtype: DType
-
-  # shared
-  valid: Variable
-  invalid_value: Union[float, int] = 0.0
-
-class ConstOp(NamedTuple):
-  value: Union[float, int]
-
-  # shared
-  valid: Variable
-  invalid_value: Union[float, int] = 0.0
-
 class UOp(NamedTuple):
   uop: UOps
-  out: Optional[Token]
-  vin: List[Token]
+  dtype: Optional[DType]
+  vin: Tuple[UOp, ...]
   arg: Any
-  def __repr__(self): return f"{str(self.uop):20s}: {str(self.out) if self.out is not None else '':25s} {str(self.vin):32s} {self.arg}"
+  def __repr__(self): return f"{self.num:4d} {str(self.uop):20s}: {str(self.dtype) if self.dtype is not None else '':25s} {str([x.num for x in self.vin]):32s} {self.arg}"
+  #def __repr__(self): return f"{str(self.uop):20s}: {str(self.dtype) if self.dtype is not None else '':25s} {str(self.vin):32s} {self.arg}"
 
-class LinearizerOptions(NamedTuple):
-  # TODO: make this generic with a list of supported types
-  supported_vector_sizes: Dict[DType, List[int]] = {dtypes.float: []}
-  supported_vector_sizes_alu: Dict[DType, List[int]] = {dtypes.float: []}
-  uses_float32_calculations: bool = True
-  has_local: bool = True
-  # NOTE: these two should be in z,y,x(reversed) order for cstyle backends, they are flipped when kernel is rendered
-  global_max: Optional[List[int]] = None
-  local_max: Optional[List[int]] = None
-  is_nvidia: Optional[bool] = None
+  # UOps are unique
+  num: int
+  def __hash__(self): return self.num
+  def __eq__(self, x): return self.num == x.num
 
-class Linearizer:
-  def __init__(self, ast:LazyOp, output_buffer:LazyBuffer, opts:LinearizerOptions):
-    # NOTE: if there's a RESHAPE, we skip it. the output shape is set from the reduce op or a latebuf
-    self.ast = ast.src[0] if ast.op == MovementOps.RESHAPE else ast
-    self.opts = opts
 
-    # get the output buffers
-    self.bufs = [output_buffer] + dedup(ast.buffers)
-    self.arg_bufs = {x:f"data{i}" for i,x in enumerate(dedup([x.realized for x in self.bufs if buf_is_kernel_arg(x)]))}
+def get_grouped_dims(prefix, start_dim, local_dims, maxdim:int=0):
+  local_idxs = loop_local_idxs = [Variable(f"{prefix}{start_dim+i}", 0, s-1) for i,s in enumerate(local_dims[0:maxdim-1] + (prod(local_dims[maxdim-1:]),) if len(local_dims) > maxdim else local_dims)]
+  if maxdim != 0 and len(local_dims) > maxdim:
+    dd = local_idxs[maxdim-1]
+    nli = []
+    for s in local_dims[maxdim-1:][::-1]:
+      nli.append(dd % s)
+      dd //= s
+    local_idxs = local_idxs[0:maxdim-1] + nli[::-1]
+  return local_idxs, [x for x in loop_local_idxs if not isinstance(x, NumNode)]
 
-    # key for lookup in cache (can change, str might not be right)
-    # bufs are needed because kernels like f(x) = x + x and f(x, y) = x + y have the same str(ast), but are different kernels.
-    # mapping the buffers to integers is required because a-b != b-a (and how would you tell a and b apart?)
-    self.key = (ast.map_buffers({x:(self.arg_bufs[x.realized] if x.realized in self.arg_bufs else x) for x in self.bufs}).key, tuple([x.key for x in self.bufs]))
-
+class Linearizer(OptimizedKernel):
   def get_buffer_name(self, i):
     if self.bufs[i].__class__ == LocalBuffer: return self.bufs[i].name
     assert self.bufs[i].realized.__class__ is not RawConst  # constants shouldn't be loaded with memops
     return self.arg_bufs[self.bufs[i].realized]
 
-  def process(self) -> None:
-    if hasattr(self, "sts"): return   # already processed
+  def uop_alu_idx(self, a:UOp, b, ops, ctx:Linearizer, op, dtype=dtypes.int32):
+    render_b:UOp = cast(UOp, (NumNode(b) if not isinstance(b, Node) else b).render(ops, ctx))
+    return self.uop(UOps.ALU, dtype, (a, render_b), op, cachable=True)
+  def const(self, b:Union[int,float], dtype=dtypes.int32) -> UOp: return self.uop(UOps.CONST, dtype, tuple(), b, cachable=True)
 
-    # fetch lazyop info
-    self.info: FlopCounter = get_lazyop_info(cast(LazyOp, self.ast))
-    self.mem_estimate: int = sum(x.dtype.itemsize*(x.realized.size if x.realized is not None else prod(x.shape)) for x in self.bufs if x is not None)
+  render_ops: Any = { Variable: lambda self, ops, ctx: ctx.loop_uops[self.expr], NumNode: lambda self, ops, ctx: ctx.const(self.b),
+                MulNode: lambda self, ops, ctx: ctx.uop_alu_idx(self.a.render(ops, ctx), self.b, ops, ctx, BinaryOps.MUL),
+                DivNode: lambda self, ops, ctx: ctx.uop_alu_idx(self.a.render(ops, ctx), self.b, ops, ctx, BinaryOps.DIV),
+                ModNode: lambda self, ops, ctx: ctx.uop_alu_idx(self.a.render(ops, ctx), self.b, ops, ctx, BinaryOps.MOD),
+                LtNode: lambda self, ops, ctx: ctx.uop_alu_idx(self.a.render(ops, ctx), self.b, ops, ctx, BinaryOps.CMPLT, dtype=dtypes.bool),
+    SumNode: lambda self,ops,ctx: functools.reduce(lambda a,b: ctx.uop_alu_idx(a, b, ops, ctx, BinaryOps.ADD), self.nodes[1:], self.nodes[0].render(ops,ctx)),
+    AndNode: lambda self,ops,ctx: functools.reduce(lambda a,b: ctx.uop_alu_idx(a, b, ops, ctx, BinaryOps.MUL, dtype=dtypes.bool), self.nodes[1:], self.nodes[0].render(ops,ctx)) }
 
-    # there's only allowed to be one reduceop
-    reduceops = [x for x in self.ast.get_lazyops() if x.op in ReduceOps]
-    assert len(dedup(reduceops)) <= 1, "max one reduce op in an ast"
-    self.reduceop = reduceops[0] if reduceops else None
+  def global_load(self, i:int, idxs:Sequence[VariableOrNum], acc=None) -> List[UOp]:
+    const = self.bufs[i].realized._buf if isinstance(self.bufs[i].realized, RawConst) else acc
 
-    # get earlybufs, before the one reduce op
-    self.earlybufs = dedup(self.reduceop.buffers) if self.reduceop else []
-
-    # create new shapetrackers inside this kernel, we will permute them
-    self.sts: List[ShapeTracker] = [x.st.copy() for x in self.bufs]
-    for st in self.sts: st.simplify()
-
-    # make the output buffer shape correct in here
-    self.sts[0].reshape(self.info.shape)
-    self.full_buf_index: int = self.bufs.index(self.earlybufs[0]) if len(self.earlybufs) > 0 else 0
-
-    # move all reduce axes to the end
-    reduce = list(enumerate(zip(self.full_shape, self.sts[0].shape)))
-    permute = tuple([i for i,(s,n) in reduce if s == n] + [i for i,(s,n) in reduce if s != n])
-    self.reshape_and_permute(None, permute)
-
-    # parameters
-    self.group_for_reduce: List[int] = []
-    self.upcasted: int = 0
-    self.local_dims: int = 0
-    self.local_alias: Dict[int, LocalBuffer] = {}
-    self.use_tensor_cores: bool = False
-    self.exclude_local_upcast: int = 0
-
-    # group simplifies
-    self.simplify_ones()
-    self.simplify_merge_adjacent()
-
-    # print early
-    if DEBUG >= 5: self.printbufs("early")
-
-  def shape_offsets(self, i): return itertools.product(*[list(range(s)) for s in self.sts[i].shape[self.shape_len-self.upcasted:][::-1]]) if self.upcasted > 0 else [tuple()]
-  def vector_axis(self, i, amt=4): return [x-(self.shape_len-self.upcasted) for x in self.sts[i].unit_stride_axes() if x >= self.shape_len-self.upcasted and self.sts[i].shape[x]%amt == 0]
-
-  def upcasted_axis(self, i):
-    return list(zip(self.sts[i].shape[self.shape_len-self.upcasted:],
-                    self.sts[i].real_strides()[self.shape_len-self.upcasted:],
-                    [x!=y for x,y in zip(self.sts[0].shape[self.shape_len-self.upcasted:], self.full_shape[self.shape_len-self.upcasted:])]))
-
-  # TODO: is there a better way to write this?
-  def acc_offsets(self, i):
-    if self.upcasted == 0: return [0]
-    upcasted_i = self.upcasted_axis(i)
-    acc_strides = [x*(1-upcasted_i[::-1][i][2]) for i,x in enumerate(strides_for_shape(tuple(1 if r else s for s,_,r in upcasted_i[::-1])))]
-    return [sum(t) for t in itertools.product(*[[y*acc_strides[i] for y in range(x[0])] for i,x in enumerate(upcasted_i[::-1])])]
-
-  def get_upcast_dim(self, i) -> List[int]:
-    vector_types = [dtypes.float32,] if self.opts.uses_float32_calculations else [dtypes.float32, dtypes.float16, dtypes.int8, dtypes.int32, dtypes.int64, ]
-    should_upcast = len(self.opts.supported_vector_sizes.get(self.bufs[i].dtype, self.opts.supported_vector_sizes[dtypes.float])) > 0 and (self.bufs[i].dtype in vector_types or isinstance(self.bufs[i].dtype, ImageDType))
-    return [x for x in self.sts[i].unit_stride_axes() if should_upcast and x >= self.shape_len-self.upcasted and self.sts[i].shape[x] > 1]
-
-  def global_load(self, i:int, idxs:Sequence[VariableOrNum], const=None) -> List[Token]:
-    if isinstance(self.bufs[i].realized, RawConst): const = self.bufs[i].realized._buf
-
-    expanded_nodes = [expand_node(idx) for idx in idxs]
+    expanded_nodes = [idx.expand() for idx in idxs]
     _idxs = [x[::-1] for x in itertools.product(*expanded_nodes[::-1])]
     upcast_dim = self.get_upcast_dim(i)
 
@@ -240,38 +96,64 @@ class Linearizer:
     if len(upcast_dim) == 1 and len(expanded_nodes[upcast_dim[0]]) in self.opts.supported_vector_sizes.get(self.bufs[i].dtype, self.opts.supported_vector_sizes[dtypes.float]):
       dim, amt = upcast_dim[0], len(expanded_nodes[upcast_dim[0]])
 
-    cache: Dict[str, Token] = {}
+    # calculate expr_idxs using placeholder variables
+    fake_idxs = [idx if isinstance(idx, NumNode) else Variable(f"_uidx{i}", idx.min, idx.max) for i, idx in enumerate(idxs)]
+    g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs)
+
     ret = []
     invalid_value = 0 if dtypes.is_int(self.bufs[i].dtype) else 0.0
     for _idx in _idxs:
+      substitute: Dict[VariableOrNum, Node] = {a: b for a, b in zip(fake_idxs, _idx) if isinstance(a, Variable)}
       if amt > 1:
-        idx, valid = self.sts[i].expr_idxs((_idx[:dim] + (expanded_nodes[dim][0],) + _idx[dim+1:]))
+        float4_substitute = {**substitute, fake_idxs[dim]: expanded_nodes[dim][0]}
+        idx, valid = g_idx.substitute(float4_substitute), g_valid.substitute(float4_substitute)
         localtype = dtypes.get_vector_type(dtypes.float if self.opts.uses_float32_calculations else self.bufs[i].dtype, amt)
-        accumtype = dtypes.get_vector_type(dtypes.float, amt) if getenv('ACCUM_FLOAT', 1) else localtype
+        accumtype = dtypes.get_vector_type(dtypes.float, amt) if (getenv('ACCUM_FLOAT', 1) and acc is not None) else localtype
         if idx.render() != ((idx//amt)*amt).render():
-          idx, valid = self.sts[i].expr_idxs(_idx)
+          idx, valid = g_idx.substitute(substitute), g_valid.substitute(substitute)
           localtype = dtypes.float if self.opts.uses_float32_calculations else self.bufs[i].dtype 
-          accumtype = dtypes.float if getenv('ACCUM_FLOAT', 1) else localtype
+          accumtype = dtypes.float if (getenv('ACCUM_FLOAT', 1) and acc is not None) else localtype
       else:
-        idx, valid = self.sts[i].expr_idxs(_idx)
+        idx, valid = g_idx.substitute(substitute), g_valid.substitute(substitute)
         localtype = dtypes.float if self.opts.uses_float32_calculations else self.bufs[i].dtype 
-        accumtype = dtypes.float if getenv('ACCUM_FLOAT', 1) else localtype
-      this_const, valid, key = (invalid_value, cast(Variable, Variable.num(1)), f"{localtype}INVALID") if valid.max == 0 else (const, valid, f"{localtype}{idx.render()}{valid.render()}")
-      if key not in cache:
-        if isinstance(self.bufs[i].dtype, ImageDType): idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
-        cache[key] = self.uop(UOps.LOAD, Token(f"val{mnum(i)}_{len(cache)}", localtype), [], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid, invalid_value)) if this_const is None else \
-                     self.uop(UOps.LOAD, Token(f"acc{mnum(i)}_{len(cache)}", accumtype), [], ConstOp(this_const, valid))
-      ret.append(Token(cache[key].name, cache[key].dtype, expanded_nodes[dim].index(_idx[dim])) if localtype.is_vector_type else cache[key])
+        accumtype = dtypes.float if (getenv('ACCUM_FLOAT', 1) and acc is not None) else localtype
+      this_const, idx, valid = (invalid_value, Variable.num(0), Variable.num(1)) if valid.max == 0 else (const, idx, valid)
+      key = f"{acc}{localtype}{this_const if this_const is not None and acc is None else self.get_buffer_name(i)}{idx.render()}{valid.render()}"
+      if key not in self.load_cache:
+        if acc is not None:
+          assert valid.min == 1
+          self.load_cache[key] = self.uop(UOps.DEFINE_ACC, accumtype, (), this_const)
+        elif this_const is not None:
+          self.load_cache[key] = self.const(this_const, localtype)
+          if valid.min == 0 and valid.max == 1:
+            valid_rendered = valid.render(self.render_ops, self)
+            self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), TernaryOps.WHERE, cachable=True)
+        else:
+          buf_uop = self.buf_uops[i]
+          assert buf_uop is not None, f"buffer {i} wasn't UOped"
+          if isinstance(self.bufs[i].dtype, ImageDType):
+            idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
+            rendered_idx = self.uop(UOps.CAST, dtypes._int2, (idx[0].render(self.render_ops, self), idx[1].render(self.render_ops, self)))
+          else:
+            rendered_idx = idx.render(self.render_ops, self)
+          if valid.min == 0:
+            valid_rendered = valid.render(self.render_ops, self)
+            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx, valid_rendered, self.const(invalid_value, localtype)))
+          else:
+            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx))
+      ret.append(self.uop(UOps.GEP, localtype, (self.load_cache[key],), expanded_nodes[dim].index(_idx[dim])) if localtype.is_vector_type else self.load_cache[key])
     return ret
 
-  def global_store(self, i, idxs:List[VariableOrNum], store:List[Token], ssa) -> None:
-    expanded_nodes = [expand_node(idx) for idx in idxs]
-    _idxs = [x[::-1] for x in itertools.product(*expanded_nodes[::-1])]
-    upcast_dim = self.get_upcast_dim(i)
+  def global_store(self, i:int, idxs:List[VariableOrNum], store:List[UOp]) -> None:
+    buf_uop = self.buf_uops[i]
+    assert buf_uop is not None, f"buffer {i} wasn't UOped"
 
+    expanded_nodes = [idx.expand() for idx in idxs]
+    _idxs = [x[::-1] for x in itertools.product(*expanded_nodes[::-1])]
     store_offset = dict(zip(_idxs, store))
 
     # float4 grouping
+    upcast_dim = self.get_upcast_dim(i)
     if len(upcast_dim) == 1 and len(expanded_nodes[upcast_dim[0]]) in self.opts.supported_vector_sizes.get(self.bufs[i].dtype, self.opts.supported_vector_sizes[dtypes.float]):
       grouped_store_offset = defaultdict(list)
       for k in store_offset:
@@ -283,47 +165,56 @@ class Linearizer:
         idx, valid = self.sts[i].expr_idxs(k)
         assert idx.render() == ((idx//amt)*amt).render(), "float4 stores are always aligned"
         assert valid.min == 1, "stores are always valid"
-        dt = dtypes.get_vector_type(dtypes.get_normal_type(dtypes.float if self.opts.uses_float32_calculations else self.bufs[i].dtype), amt=amt) 
-        if all_same([x.name for x in out_tokens]) and tuple(range(amt)) == tuple(x.offset for x in out_tokens) and out_tokens[0].dtype == self.bufs[i].dtype:
-          store_offset_new[k] = Token(out_tokens[0].name, dt)
-        else:
-          store_offset_new[k] = self.uop(UOps.CAST, ssa("alu", dt), out_tokens)
+        dt = dtypes.get_vector_type(dtypes.get_normal_type(dtypes.float if self.opts.uses_float32_calculations else self.bufs[i].dtype), amt=amt)
+        store_offset_new[k] = self.uop(UOps.CAST, dt, tuple(out_tokens))
       store_offset = store_offset_new
 
     for idx, var in store_offset.items():
       idx, valid = self.sts[i].expr_idxs(idx)
-      if isinstance(self.bufs[i].dtype, ImageDType): idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
-      self.uop(UOps.STORE, None, [var], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid))
+      if isinstance(self.bufs[i].dtype, ImageDType):
+        idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
+        rendered_idx = self.uop(UOps.CAST, dtypes._int2, tuple(x.render(self.render_ops, self) for x in idx))
+      else:
+        rendered_idx = idx.render(self.render_ops, self)
+      self.uop(UOps.STORE, None, (buf_uop, rendered_idx, var))
 
   kernel_cnt: Final[DefaultDict[str, int]] = defaultdict(int)
   def linearize(self):
     self.process()
 
+    # global uop cache
+    self.saved_exprs: Dict[Tuple, UOp] = dict()
+
     # limit dims if we need to
-    if self.opts.global_max and self.opts.local_max: self.limit_global_dims(3, self.opts.global_max, self.opts.local_max)
+    # TODO: broken, and doesn't really belong here
+    #if self.opts.global_max and self.opts.local_max: self.limit_dims_to_max(self.opts.global_max, self.opts.local_max)
 
     # uops
     self.uops: List[UOp] = []
-    self.saved_exprs: Dict[LazyOp, List[Token]] = dict()
-    self.casts = {}
+    self.buf_uops: List[Optional[UOp]] = [None]*len(self.bufs)
+    self.loop_uops: Dict[str, UOp] = {}
 
     # add global buffers
+    arg_bufs = {}
     for buf,name in self.arg_bufs.items():
-      self.uop(UOps.DEFINE_GLOBAL, None, [], (name, buf.dtype))
+      arg_bufs[buf] = self.uop(UOps.DEFINE_GLOBAL, PtrDType(buf.dtype) if not isinstance(buf.dtype, ImageDType) else buf.dtype, (), (name, buf.dtype))
+    for i,b in enumerate(self.bufs):
+      if b.realized in arg_bufs: self.buf_uops[i] = arg_bufs[b.realized]
     # add variables from symbolic shapes
-    for var in sorted(set(v for buf in self.ast.buffers for v in buf.st.var_vals), key=lambda k: k.key):
-      self.uop(UOps.DEFINE_GLOBAL, None, [], (var.expr, dtypes._arg_int32))
-
-    # add a local buffer for multistage reduce
-    if len(self.group_for_reduce):
-      # TODO: the strides of this can be controlled
-      self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + self.group_for_reduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
-      self.bufs.append(LocalBuffer("temp", self.sts[-1].size(), dtype=dtypes.float if (getenv('ACCUM_FLOAT', 1) or self.opts.uses_float32_calculations) else self.bufs[-1].dtype))
-      self.uop(UOps.DEFINE_LOCAL, None, [], ("temp", self.sts[-1].size(), dtypes.float if (getenv('ACCUM_FLOAT', 1) or self.opts.uses_float32_calculations) else self.bufs[-1].dtype))
-
+    for var in sorted(set(v for buf in self.ast.buffers for v in buf.var_vals), key=lambda k: k.key):
+      assert var.expr is not None
+      self.loop_uops[var.expr] = self.uop(UOps.DEFINE_GLOBAL, dtypes.int32, (), (var.expr, dtypes._arg_int32))
     # define local buffers
     for lb in self.local_alias.values():
-      self.uop(UOps.DEFINE_LOCAL, None, [], (lb.name, self.sts[self.bufs.index(lb)].size(), dtypes.float if (getenv('ACCUM_FLOAT', 1) or self.opts.uses_float32_calculations) else self.bufs[-1].dtype))
+      buf_dtype = dtypes.float if (getenv('ACCUM_FLOAT', 1) or self.opts.uses_float32_calculations) else self.bufs[-1].dtype
+      self.buf_uops[self.bufs.index(lb)] = self.uop(UOps.DEFINE_LOCAL, PtrDType(buf_dtype), (), (lb.name, self.sts[self.bufs.index(lb)].size(), buf_dtype))
+    # add a local buffer for multistage reduce. # TODO: use local alias
+    if self.group_for_reduce:
+      # TODO: the strides of this can be controlled
+      self.sts.append(ShapeTracker(tuple([1] * self.global_dims + list(self.full_shape[self.global_dims:self.global_dims+self.local_dims+len(self.group_for_reduce)]) + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
+      buf_dtype = dtypes.float if (getenv('ACCUM_FLOAT', 1) or self.opts.uses_float32_calculations) else self.bufs[-1].dtype
+      self.bufs.append(LocalBuffer("temp", self.sts[-1].size(), dtype=buf_dtype))
+      self.buf_uops.append(self.uop(UOps.DEFINE_LOCAL, PtrDType(buf_dtype), (), ("temp", self.sts[-1].size(), buf_dtype)))
 
     # print
     if DEBUG >= 3: self.printbufs()
@@ -332,28 +223,39 @@ class Linearizer:
     self.function_name = ("r_" if self.reduceop else "E_") + '_'.join([str(x) if isinstance(x, int) else sym_rename(x) for x in self.full_shape])
     self.display_name = ("r_" if self.reduceop else "E_") + colored('_', 'BLACK').join([colored(str(x), c) for x,c in zip(self.full_shape, self.colors())])
 
+    # name the function something unique
+    Linearizer.kernel_cnt[self.function_name] += 1
+    suffix = f"{'n'+str(Linearizer.kernel_cnt[self.function_name]-1)}" if Linearizer.kernel_cnt[self.function_name] > 1 else ""
+    self.function_name, self.display_name = self.function_name+suffix, self.display_name+colored(suffix, 'BLACK')
+
+    # define indexes
+    global_idxs, loop_global_idxs = get_grouped_dims("gidx", 0, self.full_shape[:self.global_dims], 3 if self.opts.has_local else 0)
+    local_idxs, loop_local_idxs = get_grouped_dims("lidx", self.global_dims, self.full_shape[self.global_dims:self.first_reduce+len(self.group_for_reduce)], 3 if self.opts.has_local else 0)
+    full_upcast_idxs = [Variable(None, 0, s-1) for s in self.full_shape[self.shape_len-self.upcasted:]]
+    upcast_idxs = [Variable(None, 0, s-1) for s in self.output_shape[self.shape_len-self.upcasted:]]
+
+    # global and local loops
+    def render_loop(xx:List[Variable]):
+      self.loop_uops.update({x.expr:self.uop(UOps.LOOP, dtypes.int32, (
+        self.const(x.min) if isinstance(x.min, int) else cast(Variable, x.min).render(self.render_ops, self),
+        self.const(x.max) if isinstance(x.max, int) else cast(Variable, x.max).render(self.render_ops, self))) for x in xx if not isinstance(x, NumNode) and x.expr is not None})
+    def end_loop(xx:List[Variable]):
+      for x in xx[::-1]:
+        if not isinstance(x, NumNode) and x.expr is not None:
+          loop_uop = self.loop_uops[x.expr]
+          if loop_uop.uop == UOps.LOOP: self.uop(UOps.END, None, (loop_uop,))
+
+    if self.opts.has_local:
+      self.global_size, self.local_size = [x.max+1 for x in loop_global_idxs][::-1], [x.max+1 for x in loop_local_idxs][::-1]
+      self.loop_uops.update({x.expr:self.uop(UOps.SPECIAL, dtypes.int32, (), (len(loop_global_idxs)-1-i, x.expr, x.max+1)) for i,x in enumerate(loop_global_idxs)})
+      self.loop_uops.update({x.expr:self.uop(UOps.SPECIAL, dtypes.int32, (), (len(loop_local_idxs)-1-i, x.expr, x.max+1)) for i,x in enumerate(loop_local_idxs)})
+    else:
+      render_loop(loop_global_idxs+loop_local_idxs)
+
     # parse AST
     loaded_buffers = {}
     acc = []
-
-    # ssa
-    _ssa:DefaultDict[str,int] = defaultdict(int)
-    def ssa(name, ltype=dtypes.float, add_idx=True) -> Token:
-      _ssa[name] += 1
-      name = f"{name}{_ssa[name]-1}" if add_idx else name
-      return Token(name, ltype)
-
-    # global loop
-    global_idxs = [Variable(f"gidx{i}", 0, self.full_shape[i]-1) for i in range(0, self.first_reduce-self.local_dims)]
-    self.uop(UOps.LOOP, None, [], (global_idxs, "global"))
-
-    # local loop
-    local_idxs = [Variable(f"lidx{i}", 0, self.full_shape[i]-1) for i in range(self.first_reduce-self.local_dims, self.first_reduce+len(self.group_for_reduce))]
-    self.uop(UOps.LOOP, None, [], (local_idxs, "local"))
-
-    # upcast indexes
-    full_upcast_idxs = [Variable(None, 0, s-1) for s in self.full_shape[self.shape_len-self.upcasted:]]
-    upcast_idxs = [Variable(None, 0, s-1) for s in self.output_shape[self.shape_len-self.upcasted:]]
+    self.load_cache: Dict[str, UOp] = {}
 
     # reduce op
     fake_reduce_idxs = []
@@ -366,74 +268,94 @@ class Linearizer:
       acc = self.global_load(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, {ReduceOps.SUM: 0.0, ReduceOps.MAX: -math.inf}[cast(ReduceOps, self.reduceop.op)])
 
       # reduce loop
-      self.uop(UOps.LOOP, None, [], (reduce_idxs, "reduce"))
+      render_loop(reduce_idxs)
 
       # barrier for fast GEMM
-      if self.use_tensor_cores: self.uop(UOps.BARRIER, None, [], ())
+      if self.use_tensor_cores: self.uop(UOps.BARRIER, None, ())
 
       # compute local aliases
+      # TODO: this is garbage code and should be at least moved elsewhere
       locals_to_store = []
       for i in self.local_alias:
+        localbuf_idx = self.bufs.index(self.local_alias[i])
         strides = self.sts[i].real_strides()
         extra_locals = [lidx for lidx,st in zip(local_idxs[self.exclude_local_upcast:], strides[len(global_idxs)+self.exclude_local_upcast:self.first_reduce]) if st == 0]
         this_upcast_idxs: List[Node] = []
-        for j,v in enumerate(full_upcast_idxs):
+        # TODO: just flipping the order here is likely not generic at all
+        for j,v in list(enumerate(full_upcast_idxs))[::-1] if self.reverse_upcast_dir else list(enumerate(full_upcast_idxs)):
           if strides[len(global_idxs)+len(local_idxs)+len(reduce_idxs)+j] == 0:
-            if DEBUG >= 4: print("upcasting stride 0")
+            if DEBUG >= 4: print(f"upcasting@{j} stride 0")
             this_upcast_idxs.append(Variable.num(0))
           elif (elc:=[el for el in extra_locals if v.min == el.min and v.max == el.max]):
-            if DEBUG >= 4: print(f"upcasting matched stride {elc[0]}")
+            if DEBUG >= 4: print(f"upcasting@{j} matched stride {elc[0]}")
             this_upcast_idxs.append(elc[0])
             extra_locals.remove(elc[0])
           elif (elc:=[el for el in extra_locals if v.min == el.min and (v.max+1)%(el.max+1) == 0]):
             tacc = Variable.num(0)
             rem = v.max+1
             while len(elc) and rem%(elc[0].max+1) == 0:
-              if DEBUG >= 4: print(f"upcasting partial stride {rem} {elc[0]} left: {elc[1:]}")
+              if DEBUG >= 4: print(f"upcasting@{j} partial stride {rem} {elc[0]} left: {elc[1:]}")
               rem = rem//(elc[0].max+1)
               tacc += (elc[0] * rem)
               extra_locals.remove(elc[0])
               elc = [el for el in extra_locals if v.min == el.min and rem%(el.max+1) == 0]
-            if DEBUG >= 4 and rem > 1: print(f"failed upcasting partial stride {rem} extra locals {extra_locals}")
+            if DEBUG >= 4 and rem > 1: print(f"failed upcasting@{j} partial stride {rem} extra locals {extra_locals}")
             this_upcast_idxs.append(tacc + Variable(None, 0, rem-1))
           else:
-            if DEBUG >= 4: print(f"failed upcasting stride {v} extra locals {extra_locals}")
+            if DEBUG >= 4: print(f"failed upcasting@{j} stride {v} extra locals {extra_locals}")
             this_upcast_idxs.append(v)
-        idxs = global_idxs+local_idxs+reduce_idxs+this_upcast_idxs
+        idxs = global_idxs+local_idxs+reduce_idxs+(this_upcast_idxs[::-1] if self.reverse_upcast_dir else this_upcast_idxs)
+        idxs = [idx*0 if s == 0 else idx for idx,s in zip(idxs,strides)]
+        if DEBUG >= 3: print(f"{localbuf_idx} alias {i}:", idxs)
         ll = self.global_load(i, idxs)
-        locals_to_store.append((self.bufs.index(self.local_alias[i]), idxs, ll))
+        locals_to_store.append((localbuf_idx, idxs, ll))
 
       # copy in any global buffers
       if self.use_tensor_cores:
-        i = 0
-        for y0,y1 in zip(locals_to_store[1][2][::2], locals_to_store[1][2][1::2]):
-          for x0,x1 in zip(locals_to_store[0][2][::2], locals_to_store[0][2][1::2]):
-            self.uop(UOps.WMMA, None, [x0, x1, y0, y1, acc[i], acc[i+1]], ())
-            i += 2
+        if self.bufs[0].device == "METAL":
+          if 2 * len(acc) == len(locals_to_store[0][2]) * len(locals_to_store[1][2]):
+            i = 0
+            for y0,y1 in zip(locals_to_store[1][2][::2], locals_to_store[1][2][1::2]):
+              for x0,x1 in zip(locals_to_store[0][2][::2], locals_to_store[0][2][1::2]):
+                self.uop(UOps.WMMA, None, (x0, x1, y0, y1, acc[i], acc[i+1]), "METAL")
+                i += 2
+          else:
+            k = len(locals_to_store[1][2]) // 2
+            for i in range(0, len(acc), 2):
+              for y0,y1,x0,x1 in zip(locals_to_store[1][2][:k], locals_to_store[1][2][k:], locals_to_store[0][2][k*i:], locals_to_store[0][2][k*i+k:]):
+                self.uop(UOps.WMMA, None, (x0, x1, y0, y1, acc[i], acc[i+1]), "METAL")
+        elif self.bufs[0].device == "HIP":
+          i = 0
+          for y in range(0, len(locals_to_store[1][2]), 0x10):
+            for x in range(0, len(locals_to_store[0][2]), 0x10):
+              self.uop(UOps.WMMA, None, tuple(acc[i:i+8]+locals_to_store[0][2][x:x+0x10]+locals_to_store[1][2][y:y+0x10]), "HIP")
+              i += 8
       else:
         if locals_to_store:
-          self.uop(UOps.BARRIER, None, [], ())
-          for i, idxs, ll in locals_to_store: self.global_store(i, idxs, ll, ssa)
-          self.uop(UOps.BARRIER, None, [], ())
+          self.uop(UOps.BARRIER, None, ())
+          for i, idxs, ll in locals_to_store: self.global_store(i, idxs, ll)
+          self.uop(UOps.BARRIER, None, ())
 
         # load earlybufs
-        loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs) if b in self.earlybufs and i != 0})
+        loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs[1:], start=1) if b in self.earlybufs})
 
         # run early AST (with reduce)
-        self.ast_parse(self.reduceop, [acc[off] for off in self.acc_offsets(self.full_buf_index)], loaded_buffers, ssa, do_reduce=True)
+        self.ast_parse(self.reduceop, [acc[off] for off in self.acc_offsets(self.full_buf_index)], loaded_buffers, do_reduce=True)
 
       # end the reduce loop
-      self.uop(UOps.ENDLOOP, None, [], (reduce_idxs, "reduce"))
+      end_loop(reduce_idxs)
+      self.load_cache.clear()
 
       # end the local loop, do the local reduce
       if self.group_for_reduce:
         fake_global_idxs = [x*0 for x in global_idxs]
-        self.global_store(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, acc, ssa)  # store accumulators
-        self.uop(UOps.BARRIER, None, [], ())
-        self.uop(UOps.ENDLOOP, None, [], (local_idxs, "local"))
+        self.global_store(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, acc)  # store accumulators
+        self.uop(UOps.BARRIER, None, ())
+        end_loop(loop_local_idxs)
 
-        # local indexs are over, 0 them out
-        local_idxs = [x*0 for x in local_idxs]
+        # create new late reduce local loops and replace local_idxs that have been used
+        end_local_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce and i not in self.upcast_in_mid_reduce_axes else 0) for i in range(0, self.first_reduce+len(self.group_for_reduce))]
+        local_idxs = local_idxs[:self.local_dims] + end_local_idxs[self.global_dims + self.local_dims:]
 
         # if any group_for_reduce items aren't reduces, upcast them here
         for j in self.upcast_in_mid_reduce_axes:
@@ -441,6 +363,7 @@ class Linearizer:
           self.upcast()
           self.group_for_reduce.pop()
           local_idxs = local_idxs[:-1]
+          end_local_idxs = end_local_idxs[:-1]
           # regenerate upcast_idxs
           upcast_idxs = [Variable(None, 0, s-1) for s in self.output_shape[self.shape_len-self.upcasted:]]
 
@@ -450,268 +373,102 @@ class Linearizer:
         acc = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, {ReduceOps.SUM: 0.0, ReduceOps.MAX: -math.inf}[cast(ReduceOps, self.reduceop.op)])
 
         # late reduce loop
-        end_local_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce else 0) for i in range(0, self.first_reduce+len(self.group_for_reduce))]
-        self.uop(UOps.LOOP, None, [], (end_local_idxs, "late_reduce"))
+        render_loop(end_local_idxs)
 
         # load localbufs
-        loaded_buffers["LOCAL_BUFFER"] = self.global_load(-1, end_local_idxs+fake_reduce_idxs+upcast_idxs)
+        loaded_buffers["LOCAL_BUFFER"] = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs)
 
         # there's no AST here (and there's no shape for the reduce LazyOp)
-        self.ast_parse(LazyOp(self.reduceop.op, ("LOCAL_BUFFER",)), [acc[off] for off in self.acc_offsets(-1)], loaded_buffers, ssa, do_reduce=True) # type: ignore
+        self.ast_parse(LazyOp(self.reduceop.op, ("LOCAL_BUFFER",)), [acc[off] for off in self.acc_offsets(-1)], loaded_buffers, do_reduce=True) # type: ignore
 
         # end the late reduce loop
-        self.uop(UOps.ENDLOOP, None, [], (end_local_idxs, "late_reduce"))
+        end_loop(end_local_idxs)
+        self.load_cache.clear()
 
     # load latebufs
     loaded_buffers.update({b:self.global_load(i, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer})
 
     # run late AST
-    val = self.ast_parse(self.ast, acc, loaded_buffers, ssa)
+    val = self.ast_parse(self.ast, acc, loaded_buffers)
 
     # store
-    self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val, ssa)
+    self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val)
 
-    if not self.group_for_reduce:
-      # end the global+local loop
-      self.uop(UOps.ENDLOOP, None, [], (global_idxs+local_idxs, "global+local"))
-    else:
-      # end the global loop
-      self.uop(UOps.ENDLOOP, None, [], (global_idxs, "global"))
+    # end the global (and maybe local) loop
+    end_loop(loop_global_idxs+loop_local_idxs if not self.group_for_reduce else loop_global_idxs)
 
-    # name the function something unique
-    Linearizer.kernel_cnt[self.function_name] += 1
-    suffix = f"{'n'+str(Linearizer.kernel_cnt[self.function_name]-1)}" if Linearizer.kernel_cnt[self.function_name] > 1 else ""
-    self.function_name, self.display_name = self.function_name+suffix, self.display_name+colored(suffix, 'BLACK')
+    # (recursively) remove childless uops
+    UOPS_W_SIDE_EFFECTS = {UOps.STORE, UOps.WMMA, UOps.END, UOps.BARRIER, UOps.DEFINE_GLOBAL}
+    while 1:
+      has_child: Set[UOp] = set()
+      for ru in self.uops:
+        for vu in ru.vin:
+          has_child.add(vu)
+      nu: List[UOp] = [x for x in self.uops if x in has_child or x.uop in UOPS_W_SIDE_EFFECTS]
+      if len(nu) == len(self.uops): break
+      if DEBUG >= 4: print(f"reduced UOp count from {len(self.uops)} to {len(nu)}")
+      self.uops = nu
+
     return self
 
-  _OT = TypeVar("_OT")
-  def uop(self, uop:UOps, out:_OT, vin:List[Token], arg:Any=None) -> _OT:
-    self.uops.append(UOp(uop, cast(Optional[Token], out), vin, arg))
-    if DEBUG >= 4: print(self.uops[-1])
-    return out
-  
-  @staticmethod
-  def ungroup(token):
-    assert token.dtype.is_vector_type
-    assert token.offset is None
-    if isinstance(token, Token):
-      new_tokens = []
-      for idx in range(token.dtype.sz):
-        new_tokens.append(Token(token.name, token.dtype, idx if token.dtype.is_vector_type else None))
-      return new_tokens
-    return token
+  def uop(self, uop:UOps, dtype:Optional[DType], vin:Tuple[UOp, ...], arg:Any=None, cachable=False) -> UOp:
+    key = (uop, dtype, vin, arg)
+    if uop == UOps.STORE and len(vin) == 2 and vin[0] == vin[1]: return vin[0]   # self store is noop
+    if uop == UOps.CAST and all(x.uop == UOps.GEP for x in vin) and vin[0].vin[0].dtype == dtype and all_same([x.vin[0] for x in vin]) and all(x.arg == i for i,x in enumerate(vin)): return vin[0].vin[0]
+    if uop == UOps.GEP and vin[0].uop == UOps.CONST: return self.const(vin[0].arg, dtype)
+    if uop == UOps.ALU:
+      # rewrites. NOTE: the rewritten NEG op is still around...
+      if arg == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), BinaryOps.SUB, cachable=cachable)
+      # constant folding
+      if arg == UnaryOps.NEG and vin[0].uop == UOps.CONST: return self.const(-vin[0].arg, dtype)
+      # zero folding
+      for x in [0,1]:
+        if arg == BinaryOps.ADD and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[1-x]
+        if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 1.0: return vin[1-x]
+        if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[x]
+      if arg == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
+      if arg == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
+    if cachable and key in self.saved_exprs: return self.saved_exprs[key]
+    self.uops.append(UOp(uop, dtype, vin, arg, len(self.uops)))
+    if DEBUG >= 5: print(self.uops[-1])
+    if cachable: self.saved_exprs[key] = self.uops[-1]
+    return self.uops[-1]
 
-  def ast_parse(self, x, acc, loaded_buffers, ssa, do_reduce=False) -> List[Token]:
+  def ast_parse(self, x, acc, loaded_buffers, do_reduce=False) -> List[UOp]:
     if x.__class__ is not LazyOp: return loaded_buffers[x]
-    if x.op in [UnaryOps.NOOP, UnaryOps.CAST]: return self.ast_parse(x.src[0], acc, loaded_buffers, ssa)  # cast isn't an ALU op
+    if x.op in [UnaryOps.NOOP, UnaryOps.CAST]: return self.ast_parse(x.src[0], acc, loaded_buffers)  # cast isn't an ALU op
     if x.op in ReduceOps and not do_reduce: return acc
     # MULACC fusion. TODO: this is copied from Interpreted
     if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == BinaryOps.MUL:
       x = LazyOp(TernaryOps.MULACC, x.src[0].src, x.arg)
     if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op == BinaryOps.MUL:
       x = LazyOp(TernaryOps.MULACC, x.src[0].src[0].src, x.arg)
-    if x.op in {BinaryOps.ADD, BinaryOps.MUL}:
-      # Reorder sources to put constants first so get_grouped_maybe_float4 can fold the op
-      srcs = sorted(x.src, key=lambda x: (x.realized.__class__ != RawConst) if x.__class__ == LazyBuffer else 0)
-      x.src = tuple(srcs)
-    if x not in self.saved_exprs:
-      values = [self.ast_parse(v, acc, loaded_buffers, ssa) for v in x.src]
 
-      # Cast all to highest priority dtype
-      ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
-      use_accum = x.op in ops
-      cast_dtype = dtypes.float if use_accum and getenv('ACCUM_FLOAT', 1) else dtypes.float16
-      highest_priority = max([v.dtype.priority for val in values for v in val] + [cast_dtype.priority])
-      buf_cast_dtype = [v.dtype if v.offset is None else dtypes.get_normal_type(v.dtype) for val in values for v in val if v.dtype.priority == highest_priority]
-      if len(buf_cast_dtype) > 0: cast_dtype = buf_cast_dtype[0]
-      # Special case for NVIDIA
-      is_nvidia = self.opts.is_nvidia if self.opts.is_nvidia is not None else False
-      if x.op in [UnaryOps.SQRT, UnaryOps.SIN, UnaryOps.EXP2, UnaryOps.LOG2, ReduceOps.MAX, BinaryOps.MAX] and is_nvidia: cast_dtype = dtypes.float
-      # Group values
-      grouping_allowed = 4 in self.opts.supported_vector_sizes_alu.get(cast_dtype, self.opts.supported_vector_sizes_alu[dtypes.float])
-      grouped = list(get_grouped_maybe_vector(*values, acc, grouping_allowed=grouping_allowed) if use_accum else 
-                 get_grouped_maybe_vector(*values, grouping_allowed=grouping_allowed and x.op not in {BinaryOps.CMPLT, TernaryOps.WHERE}))
-      # Cast grouped values if required
-      for idx, val in grouped:
-        for v in val:
-          if v.dtype.is_vector_type and v.offset is None and v.dtype != dtypes.get_vector_type(cast_dtype, 4) and (v, cast_dtype) not in self.casts:
-            self.casts[v, cast_dtype] = self.uop(UOps.CAST, ssa(f"casted_{cast_dtype.name}_{v.name}", dtypes.get_vector_type(cast_dtype, 4), False), self.ungroup(v))
-          elif dtypes.get_normal_type(v.dtype) != cast_dtype and (v, cast_dtype) not in self.casts:
-            offset = f"_{v.offset}" if v.offset is not None else ''
-            self.casts[v, cast_dtype] = self.uop(UOps.CAST, ssa(f"casted_{cast_dtype.name}_{v.name}{offset}", cast_dtype, False), [v])
-      # ALU with casted grouped values
-      ret = []
-      for idx, val in grouped:
-        val = [self.casts.get((v, cast_dtype), v) for v in val] # cast if needed
-        val_dtype = dtypes.get_vector_type(val[0].dtype, 4) if any(x.dtype.is_vector_type and x.offset is None for x in val) else dtypes.get_normal_type(val[0].dtype)
-        val_dtype = (dtypes._float4 if any(x.dtype.is_vector_type and x.offset is None for x in val) else dtypes.float) if self.opts.uses_float32_calculations else val_dtype
-        ret.append((idx, self.uop(UOps.ALU, val[-1] if use_accum else ssa('alu', val_dtype),
-                    list(val), ops.get(x.op, x.op))))
-      ordered_ret: List[Optional[Token]] = [None]*len(values[0])
-      # scatter
-      for i,j in ret:
-        for o,k in enumerate(i):
-          ordered_ret[k] = Token(j.name, j.dtype, o) if j.dtype.is_vector_type else j
-      assert all(isinstance(x, Token) for x in ordered_ret), "some tokens didn't get scattered?"
-      self.saved_exprs[x] = cast(List[Token], ordered_ret)
-    return self.saved_exprs[x]
+    values = [self.ast_parse(v, acc, loaded_buffers) for v in x.src]
+    ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
+    uses_accum = x.op in ops
+    uses_reduce =  x.op in {ReduceOps.SUM, ReduceOps.MAX}  
 
-  @property
-  def first_reduce(self) -> int: return [x!=y for x,y in zip(self.sts[0].shape[:self.shape_len-self.upcasted]+(0,), self.full_shape[:self.shape_len-self.upcasted]+(1,))].index(True)
+    dtypes_priority = {v.dtype: v.dtype.priority for val in values for v in val}
+    if uses_accum and getenv('ACCUM_FLOAT', 1): dtypes_priority.update({dtypes.float: dtypes.float.priority}) 
+    cast_dtype = dtypes.get_normal_type(sorted(dtypes_priority.items(), key=lambda x: -x[1])[0][0])
 
-  @property
-  def output_shape(self) -> Tuple[int, ...]: return self.sts[0].shape
+    if uses_accum: values = values + [acc]
+    ret = []
+    for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values)):
+      if uses_accum:
+        casted_val = [self.uop(UOps.CAST, dtypes.get_vector_type(cast_dtype, amt=v.dtype.sz) if v.dtype.is_vector_type and v.uop != UOps.GEP else cast_dtype, [v])
+                      if dtypes.get_normal_type(v.dtype) != cast_dtype else v for v in val]
+        ret.append((idx, self.uop(UOps.CAST, val[-1].dtype, [self.uop(
+          UOps.STORE, cast_dtype, [val[-1], self.uop(UOps.ALU, cast_dtype, casted_val if uses_reduce else val, ops[x.op])]
+          )])))
+      else:
+        ret.append((idx, self.uop(UOps.ALU, cast_dtype, val, x.op, cachable=True)))
 
-  @property
-  def full_shape(self) -> Tuple[int, ...]: return self.sts[self.full_buf_index].shape
-
-  @property
-  def full_unupcasted_shape(self) -> Tuple[int, ...]: return self.full_shape[:self.shape_len-self.upcasted]
-
-  @property
-  def shape_len(self) -> int: return len(self.sts[0].shape)
-
-  @property
-  def upcast_in_mid_reduce_axes(self) -> List[int]: return [j for j in range(self.first_reduce, self.first_reduce+len(self.group_for_reduce)) if self.full_shape[j] == self.sts[0].shape[j]]
-
-  # there's seven chunks of the shape
-  # blue   -- global dims
-  # cyan   -- local dims
-  #  *** self.first_reduce
-  # green  -- reduce-local dims
-  # white  -- reduce-late upcasted dim (self.upcast_in_mid_reduce_axes)
-  # red    -- reduce loops
-  #  *** self.upcasted
-  # purple -- reduce upcasted
-  # yellow -- normal upcasted dimensions
-  def colors(self) -> List[str]:
-    # up to first_reduce, they are all global (blue)
-    colors = ["blue"] * (self.first_reduce-self.local_dims)
-    # except the local_dims, these are non-reduce locals (cyan)
-    colors += ["cyan"] * (self.local_dims)
-    # between first_reduce and first_reduce + group_for_reduce, they are either local (cyan), or late upcasted (green)
-    colors += ["white" if i in self.upcast_in_mid_reduce_axes else "green" for i in range(self.first_reduce, self.first_reduce + len(self.group_for_reduce))]
-    # between first_reduce + group_for_reduce and upcasted, they are reduce (red)
-    colors += ["red"] * ((self.shape_len-self.upcasted) - (self.first_reduce + len(self.group_for_reduce)))
-    # upcasted dimensions are reduce (magenta) or normal (yellow)
-    colors += ["magenta" if self.full_shape[i] != self.sts[0].shape[i] else "yellow" for i in range(self.shape_len-self.upcasted, self.shape_len)]
-    assert len(colors) == self.shape_len, "colors size mismatch"
-    return colors
-
-  def colored_shape(self) -> str: return ' '.join(colored(s, color) for s,color in zip([f"{s:4d}" if isinstance(s, int) else s for s in self.full_shape], self.colors()))
-  def printbufs(self, prefix=""):
-    for i in range(len(self.sts)):
-      print(prefix, f"{i:3d} {str(self.bufs[i].realized) if self.bufs[i].realized is not None else str(self.bufs[i]):47s}", self.sts[i].views)
-    print(self.colored_shape())
-
-  # ******************** base simplifiers ********************
-
-  # apply reshape and permute to all shapetrackers
-  def reshape_and_permute(self, new_shape_fxn, axis):
-    for st in self.sts:
-      if new_shape_fxn is not None: st.reshape(tuple(new_shape_fxn(st.shape)))
-      if axis is not None: st.permute(tuple(axis))
-
-  # drops the final dimension
-  def upcast(self):
-    assert self.full_shape[-1] != 1, "can't upcast a dimension with size 1"
-    self.upcasted += 1
-
-  # axis : the axis to pull from
-  # amount : the amount to take
-  # top : if you want to pull that amount from the top
-  # insert_before : place to insert the new stuff
-  def shift_to(self, axis, amount, top=False, insert_before=None):
-    if insert_before is None: insert_before = self.shape_len
-    move_axis = axis if top else axis+1
-    if move_axis < insert_before: insert_before += 1
-    self.reshape_and_permute(
-      lambda x: list(x[0:axis]) + (([amount, x[axis]//amount] if top else [x[axis]//amount, amount]) if x[axis] > 1 else [1,1]) + list(x[axis+1:]),
-      [i for i in range(insert_before) if i != move_axis] + [move_axis] + [i for i in range(insert_before, self.shape_len+1) if i != move_axis])
-
-  # ******************** complex simplifiers ********************
-
-  def simplify_ones(self):
-    # remove places where the shape is all ones
-    # TODO: this should be factored in to multi shape stride
-    if self.shape_len == 0: return
-    all_ones = [s==1 for s in self.full_shape]
-    self.local_dims -= sum(all_ones[self.first_reduce-self.local_dims:self.first_reduce])
-    self.upcasted -= sum(all_ones[self.shape_len-self.upcasted:])
-    self.reshape_and_permute(lambda shape: [x for i,x in enumerate(shape) if not all_ones[i]], None)
-
-  def simplify_merge_adjacent(self):
-    if self.shape_len == 0: return
-    shapes, strides = [x.shape for x in self.sts], [x.real_strides() for x in self.sts]
-
-    # merge dimensions if we can, multi get_shape_strides
-    # TODO: does this always preserve the reduce dimension, NO
-    # TODO: move this into shapetracker, with tests!
-    rets = [[(shapes[j][0], strides[j][0])] for j in range(len(shapes))]
-    for i in range(1, len(shapes[0])):
-      can_merge = []
-      for j in range(len(shapes)):
-        # TODO: added the always mergeability of 1s, is this right? if so, add to shapetracker in the 1 case
-        can_merge.append(strides[j][i] is not None and ((strides[j][i] != 0 and rets[j][-1][1] == shapes[j][i]*cast(int, strides[j][i])) or (strides[j][i] == 0 and rets[j][-1][1] == 0)))
-      # more can merge than this
-      mergeable = all(can_merge) and i != self.first_reduce
-      for j in range(len(shapes)):
-        if mergeable: rets[j][-1] = (rets[j][-1][0] * shapes[j][i], strides[j][i])
-        else: rets[j].append((shapes[j][i], strides[j][i]))
-
-    # do the reshapes
-    for i,x in enumerate(rets): self.sts[i].reshape(tuple([y[0] for y in x]))
-
-  # ******************** GPU simplifiers ********************
-  def _limit_size(self, x: Tuple[int], max_size: List) -> Tuple[int, ...]:
-    new_shape,dims = list(x), len(x)
-    for i in range(dims):
-      next_idx = (i + 1) % dims
-      while new_shape[i] > max_size[i]:
-        new_shape[i] = new_shape[i] // 2
-        if (new_shape[next_idx] <= max_size[next_idx]):
-          new_shape[next_idx] = new_shape[next_idx] * 2
-        else:
-          next_idx = (next_idx + 1) % dims
-          new_shape[next_idx] = new_shape[next_idx] * 2
-    return tuple(new_shape)
-
-  def limit_global_dims(self, limit: int, global_max: List[int], local_max: List[int]):
-    # sometimes, there's more dimensions than len(self.lang.gid).
-    # compact all the dimensions into the first
-    # NOTE: this might make multiview shapetrackers
-    if (self.first_reduce-self.local_dims) > limit:
-      num_to_merge = ((self.first_reduce-self.local_dims) - limit)+1
-      self.reshape_and_permute(lambda x: (prod(x[0:num_to_merge]),)+x[num_to_merge:], None)
-      if DEBUG >= 3: print("reshaped to", self.full_shape, "due to too many global dimensions")
-    # Check the global allocation limit, current the global_size will be flipped during codegen
-    # and then padded right with 1s if its length < 3 which makes this part a bit awkward to write
-    global_dims = self.first_reduce-self.local_dims
-    if global_dims > 0:
-      if global_max:
-        tmp = global_max[:global_dims] + (local_max[:self.local_dims] if local_max else [])
-        if max(global_max) < max(self.full_shape[:global_dims]): self.reshape_and_permute(lambda x: self._limit_size(x, tmp + [math.inf] * (len(self.full_shape)-len(tmp))), None)
-        assert max(global_max) >= max(self.full_shape[:global_dims]), f"device max allocation {max(self.full_shape[:global_dims])} exceeds global dim maximum {max(global_max)}"
-      for i in range(global_dims-1):
-        if self.full_shape[i] > global_max[i]:
-          order = list(range(len(self.full_shape)))
-          order[i], order[global_dims-1] = order[global_dims-1], order[i]
-          self.reshape_and_permute(None, order)
-          if DEBUG >= 3: print("permuted global dim", order, "due to allocation exceeds global limit")
-
-  def alias_buffer(self, i, pattern):
-    assert len(pattern) == len(self.sts[i].shape), f"must include a pattern for each shape {pattern} {self.sts[i].shape}"
-
-    bst = 1
-    real_strides = self.sts[i].real_strides()
-    shp, stride = [(s if p != 0 else 1) for s,p in zip(self.sts[i].shape, pattern)], [0]*len(pattern)
-    for priority in range(1, max(pattern)+1):  # priority. 0 is non local and ignored
-      for j,p in enumerate(pattern):
-        if priority == p and real_strides[j] != 0:
-          stride[j] = bst
-          bst *= shp[j]
-
-    self.sts.append(ShapeTracker(tuple(shp), [View(tuple(shp), tuple(stride))]))
-    self.bufs.append(LocalBuffer(name=f"ldata{i}", size=self.sts[-1].size(), dtype=dtypes.float if self.opts.uses_float32_calculations else self.bufs[-1].dtype))
-    if DEBUG >= 4: print("aliasing buffer", self.sts[i])
-    self.local_alias[i] = self.bufs[-1]
+    ordered_ret: List[Optional[UOp]] = [None]*len(values[0])
+    # scatter
+    for i,j in ret:
+      for k in i:
+        ordered_ret[k] = j
+    assert all(isinstance(x, UOp) for x in ordered_ret), "some tokens didn't get scattered?"
+    return cast(List[UOp], ordered_ret)

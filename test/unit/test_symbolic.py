@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import unittest
-from tinygrad.shape.symbolic import MulNode, SumNode, Variable, NumNode, LtNode, sym_render
+from tinygrad.shape.symbolic import Node, MulNode, SumNode, Variable, NumNode, LtNode, sym_render, sym_infer
 
 class TestSymbolic(unittest.TestCase):
   def helper_test_variable(self, v, n, m, s):
@@ -173,6 +173,9 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable(Variable("a", 0, 6) < 3, 0, 1, "(a<3)")
     self.helper_test_variable(Variable("a", 0, 6) < 8, 1, 1, "1")
 
+  def test_lt_sum_remove(self):
+    self.helper_test_variable((Variable("a", 0, 6) + 2) < 3, 0, 1, "(a<1)")
+
   def test_and_fold(self):
     self.helper_test_variable(Variable.ands([Variable.num(0), Variable("a", 0, 1)]), 0, 0, "0")
 
@@ -276,26 +279,45 @@ class TestSymRender(unittest.TestCase):
     assert sym_render(a+1) == "(1+a)"
     assert sym_render(a*b) == "(a*b)"
 
+class TestSymInfer(unittest.TestCase):
+  def test_sym_infer(self):
+    a = Variable("a", 0, 10)
+    b = Variable("b", 0, 10)
+    c = Variable("c", 0, 10)
+    var_vals = {a: 2, b: 3, c: 4}
+    assert sym_infer(5, var_vals) == 5
+    assert sym_infer(a, var_vals) == 2
+    assert sym_infer(b, var_vals) == 3
+    assert sym_infer(a+b, var_vals) == 5
+    assert sym_infer(a-b, var_vals) == -1
+    assert sym_infer(a+b+c, var_vals) == 9
+    assert sym_infer(a*b, var_vals) == 6
+    assert sym_infer(a*b+c, var_vals) == 10
+
 class TestSymbolicSymbolicOps(unittest.TestCase):
-  def test_node_div_node(self):
+  def test_node_divmod_node(self):
     i = Variable("i", 1, 10)
     idx0 = Variable("idx0", 0, i*3-1)
     assert NumNode(0) // (Variable("i", 1, 10)*128) == 0
-    assert NumNode(127) // (Variable("i", 1, 10)*128) == 0
-    assert idx0 // (i*3) == 0
-    assert i // i == 1
-
-  def test_node_mod_node(self):
-    i = Variable("i", 1, 10)
-    idx0 = Variable("idx0", 0, i*3-1)
     assert NumNode(0) % (Variable("i", 1, 10)*128) == 0
+    assert NumNode(127) // (Variable("i", 1, 10)*128) == 0
     assert NumNode(127) % (Variable("i", 1, 10)*128) == 127
-    assert NumNode(128) % (Variable("i", 1, 10)*128 + 128) == 128
-    assert 0 % (Variable("i", 1, 10)*128) == 0
+    assert 127 // (Variable("i", 1, 10)*128) == 0
     assert 127 % (Variable("i", 1, 10)*128) == 127
+    assert NumNode(128) // (Variable("i", 1, 10)*128 + 128) == 0
+    assert NumNode(128) % (Variable("i", 1, 10)*128 + 128) == 128
+    assert 128 // (Variable("i", 1, 10)*128 + 128) == 0
     assert 128 % (Variable("i", 1, 10)*128 + 128) == 128
+    assert 0 // (Variable("i", 1, 10)*128) == 0
+    assert 0 % (Variable("i", 1, 10)*128) == 0
+    assert idx0 // (i*3) == 0
     assert idx0 % (i*3) == idx0
+    assert i // i == 1
     assert i % i == 0
+    assert 128 // NumNode(4) == 32
+    assert 128 % NumNode(4) == 0
+    assert NumNode(128) // NumNode(4) == 32
+    assert NumNode(128) % NumNode(4) == 0
 
   def test_mulnode_divmod_node(self):
     i = Variable("i", 1, 10)
@@ -311,7 +333,26 @@ class TestSymbolicSymbolicOps(unittest.TestCase):
     idx2 = Variable("idx2", 0, i)
     assert (idx0*(i*4+4)+idx1*(i+1)+idx2) // (i+1) == idx0*4+idx1
     assert (idx0*(i*4+4)+idx1*(i+1)+idx2) % (i+1) == idx2
+    assert (i+1) // (i*128+128) == 0
     assert (i+1) % (i*128+128) == (i+1)
+    assert (i+1+idx2) // (i+1) == 1
+    assert (i+1+idx2) % (i+1) == idx2
+    assert (idx0*(i*4+4)+i+1+idx2) // (i+1) == idx0*4+1
+    assert (idx0*(i*4+4)+i+1+idx2) % (i+1) == idx2
+    assert (i*128+128)*2 // (i*128+128) == 2
+    assert (i*128+128)*2 % (i*128+128) == 0
+
+  def test_sumnode_divmod_sumnode_complex(self):
+    i = Variable("i", 1, 1024)
+    gidx0 = Variable("gidx0", 0, i)
+    lidx1 = Variable("lidx1", 0, 7)
+    ridx2 = Variable("ridx1", 0, 31)
+    assert ((i*128+128)*2 + gidx0*128 + lidx1*(i*512+512) + ridx2*4) // (i*128+128) == 2 + lidx1*4
+    assert ((i*128+128)*2 + gidx0*128 + lidx1*(i*512+512) + ridx2*4) % (i*128+128) == gidx0*128 + ridx2*4
+    assert ((gidx0*128+i*128+ridx2*4+129)) // (i*128+128) == 1
+    assert ((gidx0*128+i*128+ridx2*4+129)) % (i*128+128) == gidx0*128 + ridx2*4 + 1
+    assert (ridx2*(i*4+4)+1+i+gidx0) // (i*128+128) == 0
+    assert (ridx2*(i*4+4)+1+i+gidx0) % (i*128+128) == (ridx2*(i*4+4)+1+i+gidx0)
 
   def test_node_lt_node(self):
     a = Variable("a", 1, 5)
@@ -330,11 +371,73 @@ class TestSymbolicSymbolicOps(unittest.TestCase):
     assert a > 3
 
   def test_num_node_mul_node(self):
-    a = NumNode(2)
-    b = Variable("b", 1, 5)
-    c = a * b
-    assert c == b * 2
-    assert isinstance(c, MulNode)
+    a = Variable("a", 1, 5)
+    b = NumNode(2) * a
+    assert b == a * 2
+    assert isinstance(b, MulNode)
+    b = NumNode(1) * a
+    assert b == a
+    assert isinstance(b, Variable)
+    b = NumNode(0) * a
+    assert b == 0
+    assert isinstance(b, NumNode)
+
+  def test_num_node_expand(self):
+    a = NumNode(42)
+    assert a.expand() == [a]
+
+  def test_variable_expand(self):
+    a = Variable("a", 5, 7)
+    assert a.expand() == [a]
+
+  def test_variable_expand_expr_none(self):
+    a = Variable(None, 5, 7)
+    assert a.expand() == [NumNode(5), NumNode(6), NumNode(7)]
+
+  def test_mul_node_expand(self):
+    a = Variable(None, 5, 7)
+    m = MulNode(a, 3)
+    assert m.expand() == [NumNode(15), NumNode(18), NumNode(21)]
+
+    b = Variable("b", 1, 3)
+    n = MulNode(b, 3)
+    assert n.expand() == [Variable("b", 1, 3)*3]
+
+  def test_sum_node_expand(self):
+    a = Variable(None, 1, 3)
+    b = Variable("b", 5, 7)
+
+    s1 = SumNode([a, b])
+    assert s1.expand() == [Variable.sum([NumNode(i),b]) for i in range(1,4)]
+
+    c = Variable(None, 5, 7)
+
+    s2 = SumNode([a, c])
+    assert s2.expand() == [Variable.sum([NumNode(i),NumNode(j)]) for (i,j) in [(1,5), (1,6), (1,7), (2,5), (2,6), (2,7), (3,5), (3,6), (3,7)]]
+
+  @unittest.skip("these nodes are expandable now")
+  def test_non_expandable_nodes(self):
+    expandable_nodes = [Variable, NumNode, MulNode, SumNode]
+
+    def test_non_expandable_nodes_recursive(node_cls: Node):
+      for node_subcls in node_cls.__subclasses__():
+        # skip expandable classes
+        if node_subcls in expandable_nodes:
+          continue
+
+        # recurse over subclasses
+        test_non_expandable_nodes_recursive(node_subcls)
+
+        # skip classes with abstract methods
+        if len(node_subcls.__abstractmethods__) > 0:
+          continue
+
+        # test that node expand is not implemented
+        node = node_subcls.__new__(node_subcls)
+        self.assertRaises(NotImplementedError, node.expand)
+
+    test_non_expandable_nodes_recursive(Node)
+
 
 if __name__ == '__main__':
   unittest.main()
