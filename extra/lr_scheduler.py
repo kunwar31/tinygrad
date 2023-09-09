@@ -2,6 +2,7 @@ import math
 from typing import List
 from tinygrad.nn.optim import Optimizer
 from tinygrad.tensor import Tensor
+from tinygrad.helpers import dtypes
 
 class LR_Scheduler:
   def __init__(self, optimizer: Optimizer):
@@ -12,7 +13,7 @@ class LR_Scheduler:
 
   def step(self) -> None:
     self.epoch_counter.assign(self.epoch_counter + 1).realize()
-    self.optimizer.lr.assign(self.get_lr()).realize()
+    self.optimizer.lr.assign(self.get_lr().cast(self.optimizer.lr.dtype)).realize()
 
 class MultiStepLR(LR_Scheduler):
   def __init__(self, optimizer: Optimizer, milestones: List[int], gamma=0.1):
@@ -66,15 +67,15 @@ class CosineAnnealingLR(LR_Scheduler):
 class OneCycleLR(LR_Scheduler):
   def __init__(self, optimizer: Optimizer, max_lr: float, div_factor: float, final_div_factor: float, total_steps: int, pct_start: float,
                anneal_strategy: str = 'linear', cycle_momentum: bool = False):
-    self.initial_lr = Tensor([max_lr / div_factor]).contiguous()
-    self.max_lr = Tensor([max_lr]).contiguous()
+    self.initial_lr = Tensor([max_lr / div_factor], dtype=dtypes.float).contiguous()
+    self.max_lr = Tensor([max_lr], dtype=dtypes.float).contiguous()
     self.min_lr = self.initial_lr/final_div_factor
     super().__init__(optimizer)
     self.total_steps = total_steps
     self.pct_start = pct_start
     assert anneal_strategy == 'linear', 'only linear annealing supported'
     assert not cycle_momentum, 'cycle momentum not supported'
-    self.optimizer.lr.assign(self.get_lr()).realize() # update the initial LR
+    self.optimizer.lr.assign(self.get_lr().cast(self.optimizer.lr.dtype)).realize() # update the initial LR
 
   @staticmethod
   def _annealing_linear(start: Tensor, end: Tensor, pct: Tensor) -> Tensor: return ((end - start) * pct + start)
