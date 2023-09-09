@@ -267,7 +267,7 @@ def train_cifar(bs=BS, eval_bs=EVAL_BS, steps=STEPS, seed=32):
     Y = Y.half()
     out = model(X)
     print(out.dtype)
-    loss = cross_entropy(out, Y, reduction='none' ,label_smoothing=0.1).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler'])
+    loss = cross_entropy(out, Y, reduction='none' ,label_smoothing=0.2).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler'])
 
     if not getenv("DISABLE_BACKWARD"):
       # index 0 for bias and 1 for non-bias
