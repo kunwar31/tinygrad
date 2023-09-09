@@ -154,10 +154,10 @@ def make_square_mask(shape, mask_size):
   is_even = int(mask_size % 2 == 0)
   center_max = shape[-2]-mask_size//2-is_even
   center_min = mask_size//2-is_even
-  center = Tensor.rand(X.shape[0], dtype=dtypes.float32)*(center_max-center_min)+center_min
+  center = Tensor.rand(shape[0], dtype=dtypes.float32)*(center_max-center_min)+center_min
 
-  d_y = Tensor.arange(0, X.shape[-2], dtype=dtypes.float32).reshape((1,1,X.shape[-2],1))
-  d_x = Tensor.arange(0, X.shape[-1], dtype=dtypes.float32).reshape((1,1,1,X.shape[-1]))
+  d_y = Tensor.arange(0, shape[-2], dtype=dtypes.float32).reshape((1,1,shape[-2],1))
+  d_x = Tensor.arange(0, shape[-1], dtype=dtypes.float32).reshape((1,1,1,shape[-1]))
   d_y = d_y - center.reshape((-1,1,1,1))
   d_x = d_x - center.reshape((-1,1,1,1))
   d_y =(d_y >= -(mask_size / 2)) * (d_y <= mask_size / 2)
