@@ -29,7 +29,7 @@ Tensor.default_type = dtypes.float16
 
 class BatchNorm(nn.BatchNorm2d):
   def __init__(self, num_features):
-    super().__init__(num_features, track_running_stats=False, eps=1e-12, momentum=0.85, affine=True)
+    super().__init__(num_features, track_running_stats=False, eps=1e-7, momentum=0.85, affine=True)
     self.weight.requires_grad = False
     self.bias.requires_grad = True
 
