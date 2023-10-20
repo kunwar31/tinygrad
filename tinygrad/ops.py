@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time, importlib, inspect, functools, pathlib, itertools, random
 import numpy as np
+import shelve
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Union, Type, Tuple, Any, List, Optional, Dict, Callable, cast, Mapping
 from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored, BEAM
@@ -223,14 +224,18 @@ class ASTRunner:
 class Compiled:
   def __init__(self, buffer: Type[RawBuffer], linearizer_opts, renderer, runtime, synchronize=lambda: None, batch_exec=BasicBatchExecutor):
     self.buffer, self.linearizer_opts, self.renderer, self.runtime, self.synchronize, self.batch_exec = buffer, linearizer_opts, renderer, runtime, synchronize, batch_exec
-    self.method_cache: Dict[LazyOp, ASTRunner] = {}
+    self.method_cache = shelve.open('./method_cache')
 
-  def to_program(self, k):
+  def to_code(self, k):
     k.linearize()
     src, runtime_args = self.renderer(k.function_name, k.uops)
-    return ASTRunner(k.function_name, src, k.global_size, k.local_size,
-                     op_estimate=k.info.flops, mem_estimate=k.mem_estimate,
-                     display_name=k.display_name, runtime_args=runtime_args).build(self.runtime, self.batch_exec)
+    return k.function_name, src, k.global_size, k.local_size, k.info.flops, k.mem_estimate, k.display_name, runtime_args
+
+  def to_program(self, code_args):
+    function_name, src, global_size, local_size, info_flops, mem_estimate, display_name, runtime_args = code_args
+    return ASTRunner(function_name, src, global_size, local_size,
+                     op_estimate=info_flops, mem_estimate=mem_estimate,
+                     display_name=display_name, runtime_args=runtime_args).build(self.runtime, self.batch_exec)
 
   def exec_ast(self, ast:LazyOp, output, inputs, var_vals, **kwargs):
     # check if we can reuse the output buffer
@@ -261,7 +266,7 @@ class Compiled:
     assert all(v.val is None for v in ast_vars), f"ast contains bound Variable {ast_vars}"
 
     # compilation time
-    def get_program():
+    def get_code():
       from tinygrad.codegen.linearizer import Linearizer
       k = Linearizer(ast, self.linearizer_opts)
       assert k.info.dtype == output.dtype, f"linearizer must match dtype. linearizer wants {k.info.dtype} but buffer is {output.dtype}"
@@ -277,13 +282,13 @@ class Compiled:
           if beamtime < baseline:
             if DEBUG >= 1: print(f"beam search {beamtime*1e6:<12.2f} beat baseline {baseline*1e6:<12.2f} by {baseline/beamtime:.2f}x")
             k = kb
-      return self.to_program(k)
+      return self.to_code(k)
 
     if getenv("ENABLE_METHOD_CACHE", 1):
-      if ast not in self.method_cache: self.method_cache[ast] = get_program()
-      prg = self.method_cache[ast]
+      if str(ast) not in self.method_cache: self.method_cache[str(ast)] = get_code()
+      prg = self.to_program(self.method_cache[str(ast)])
     else:
-      prg = get_program()
+      prg = self.to_program(get_code())
 
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
 
