@@ -224,7 +224,8 @@ class ASTRunner:
 class Compiled:
   def __init__(self, buffer: Type[RawBuffer], linearizer_opts, renderer, runtime, synchronize=lambda: None, batch_exec=BasicBatchExecutor):
     self.buffer, self.linearizer_opts, self.renderer, self.runtime, self.synchronize, self.batch_exec = buffer, linearizer_opts, renderer, runtime, synchronize, batch_exec
-    self.method_cache = shelve.open('./method_cache')
+    self.method_cache = shelve.open(getenv('METHOD_CACHE', './method_cache'))
+    self.method_cache_in_mem = {}
 
   def to_code(self, k):
     k.linearize()
@@ -286,7 +287,8 @@ class Compiled:
 
     if getenv("ENABLE_METHOD_CACHE", 1):
       if str(ast) not in self.method_cache: self.method_cache[str(ast)] = get_code()
-      prg = self.to_program(self.method_cache[str(ast)])
+      if ast not in self.method_cache_in_mem: self.method_cache_in_mem[ast] = self.to_program(self.method_cache[str(ast)])
+      prg = self.method_cache_in_mem[ast]
     else:
       prg = self.to_program(get_code())
 
