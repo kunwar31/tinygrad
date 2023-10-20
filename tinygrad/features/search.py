@@ -28,7 +28,8 @@ def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=Tru
   var_vals = {k:k.min for k in vars_from_ast(lin.ast)}
   try:
     lin.linearize()
-    prg = cast(Compiled, Device[Device.DEFAULT]).to_program(lin)
+    device_compiler = cast(Compiled, Device[Device.DEFAULT])
+    prg = device_compiler.to_program(device_compiler.to_code(lin))
     real_global_size = prg.global_size
     if allow_test_size and prg.global_size:
       test_global_size = prg.global_size[:]
