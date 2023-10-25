@@ -21,6 +21,8 @@ actions += [
 # returns time in seconds
 import shelve
 logtm = shelve.open(getenv("LOGTM", "")) if getenv("LOGTM", "") else None
+step_cache = shelve.open(getenv('STEP_CACHE', './step_cache'))
+
 def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=True, max_global_size=65536, cnt=3, should_copy=True, disable_cache=False) -> float:
   key = str((lin.ast, lin.applied_opts))
   if should_copy and not disable_cache and logtm is not None and key in logtm: return min(logtm[key])  # pylint: disable=E1135 # NOTE: we check should_copy since this may have side effects
@@ -89,7 +91,7 @@ def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Lineariz
       pass
   return acted_lins
 
-def beam_search(lin, rawbufs, amt):
+def beam_search(lin: Linearizer, rawbufs, amt):
   best_tm = float('inf')
   beam: List[Linearizer] = [lin]
   while 1:
@@ -99,5 +101,6 @@ def beam_search(lin, rawbufs, amt):
     if len(opts) == 0 or best_tm <= opts[0][1]: break  # we didn't get faster
     best_tm = opts[0][1]
     beam = [x[0] for x in opts[:amt]]
+    step_cache[str(beam[0].ast) + '\n\n' + str(beam[0].applied_opts[:-1])] = str(beam[0].applied_opts[-1])
     if DEBUG >= 1: print(f"{opts[0][1]*1e6:12.2f} us from {len(opts):3d} actions", beam[0].colored_shape())
   return beam[0]
