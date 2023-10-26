@@ -166,15 +166,32 @@ def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Lineariz
   return acted_lins
 
 def predict_policy(lin:Linearizer, top_policies):
+  acted_lins = {}
   ast, applied_opts = lin.ast, lin.applied_opts
-  valid_ops = [x.applied_opts[-1] for x in get_linearizer_actions(lin, include_0=False).values()]
   with torch.no_grad():
     sft = torch.nn.Softmax(1)
     tokens = torch.tensor(tokenize((ast, [action_to_label[opt] for opt in applied_opts])).ids[-200:])
     raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), None)).squeeze(0).cpu().numpy()))
-  pred_ops = {eval(op): prob for op,prob in raw.items() if eval(op) in valid_ops}
+  pred_ops = {eval(op): prob for op,prob in raw.items()}
   s = sorted(pred_ops.items(), key=lambda x:-x[1])
-  return s[:top_policies]
+  for i, a in enumerate(s):
+    if i >= top_policies:
+      break
+    if a.axis >= lin.shape_len: continue
+    if lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
+    lin2 = lin.copy()
+    try:
+      lin2.apply_opt(a)
+      up, lcl = 1, 1
+      for s,c in zip(lin2.full_shape, lin2.colors()):
+        if c in {"magenta", "yellow"}: up *= s
+        if c in {"cyan", "green", "white"}: lcl *= s
+      if up > 256 or lcl > 256: continue
+      acted_lins[i+1] = lin2
+    except Exception:
+      pass
+  return acted_lins
+
 
 def beam_search(lin: Linearizer, rawbufs, amt):
   best_tm = float('inf')
