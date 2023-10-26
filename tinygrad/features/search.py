@@ -68,7 +68,9 @@ import pickle
 from tokenizers import Tokenizer
 
 tokenizer = Tokenizer.from_file('ast_tokenizer.tok')
-m = torch.load('policynet.bin').cuda()
+m = TextCNN(366, 32, 4, (30,), (3,), 59, 0.3)
+m.load_state_dict(torch.load('policynet.bin'))
+m = m.eval().cuda()
     
 with open('mapping.pkl', 'rb') as f:
   vocab = pickle.load(f)
