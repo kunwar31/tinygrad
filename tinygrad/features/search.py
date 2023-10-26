@@ -179,8 +179,6 @@ def predict_policy(lin:Linearizer, top_policies):
     if a is None:
       acted_lins[i+1] = lin.copy()
       continue
-    if added >= top_policies:
-      break
     if a.axis >= lin.shape_len: continue
     if lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
     lin2 = lin.copy()
@@ -193,6 +191,8 @@ def predict_policy(lin:Linearizer, top_policies):
       if up > 256 or lcl > 256: continue
       acted_lins[i+1] = lin2
       added += 1
+      if added >= top_policies:
+        break
     except Exception:
       pass
   return acted_lins
@@ -202,7 +202,7 @@ def beam_search(lin: Linearizer, rawbufs, amt):
   best_tm = float('inf')
   beam: List[Linearizer] = [lin]
   while 1:
-    acted_lins = flatten([predict_policy(lin, top_policies=amt).values() for lin in beam])
+    acted_lins = flatten([predict_policy(lin, top_policies=getenv('BEAM_P', amt)).values() for lin in beam])
     timed_lins = [(v,time_linearizer(v, rawbufs)) for v in acted_lins]
     opts = sorted(timed_lins, key=lambda x: x[1])
     if len(opts) == 0 or best_tm <= opts[0][1]: break  # we didn't get faster
