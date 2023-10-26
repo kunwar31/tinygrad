@@ -171,7 +171,7 @@ def predict_policy(lin:Linearizer, top_policies):
   with torch.no_grad():
     sft = torch.nn.Softmax(1)
     tokens = torch.tensor(tokenize((ast, [action_to_label[opt] for opt in applied_opts])).ids[-200:])
-    raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), _)).squeeze(0).cpu().numpy()))
+    raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), None)).squeeze(0).cpu().numpy()))
   pred_ops = {eval(op): prob for op,prob in raw.items() if eval(op) in valid_ops}
   s = sorted(pred_ops.items(), key=lambda x:-x[1])
   return s[:top_policies]
