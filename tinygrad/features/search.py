@@ -70,7 +70,7 @@ from tokenizers import Tokenizer
 tokenizer = Tokenizer.from_file('ast_tokenizer.tok')
 m = TextCNN(366, 32, 4, (30,), (3,), 59, 0.3)
 m.load_state_dict(torch.load('policynet.bin'))
-m = m.eval().cuda()
+m = m.eval()
     
 with open('mapping.pkl', 'rb') as f:
   vocab = pickle.load(f)
@@ -171,7 +171,7 @@ def predict_policy(lin:Linearizer, top_policies):
   with torch.no_grad():
     sft = torch.nn.Softmax(1)
     tokens = torch.tensor(tokenize((ast, [action_to_label[opt] for opt in applied_opts])).ids[-200:])
-    raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0).cuda(), _)).squeeze(0).cpu().numpy()))
+    raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), _)).squeeze(0).cpu().numpy()))
   pred_ops = {eval(op): prob for op,prob in raw.items() if eval(op) in valid_ops}
   s = sorted(pred_ops.items(), key=lambda x:-x[1])
   return s[:top_policies]
