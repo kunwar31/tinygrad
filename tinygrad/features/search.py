@@ -173,9 +173,10 @@ def predict_policy(lin:Linearizer, top_policies):
     tokens = torch.tensor(tokenize((ast, [action_to_label[opt] for opt in applied_opts])).ids[-200:])
     raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), None)).squeeze(0).cpu().numpy()))
   pred_ops = {eval(op): prob for op,prob in raw.items()}
-  s = sorted(pred_ops.items(), key=lambda x:-x[1])
-  for i, a in enumerate(s):
-    if i >= top_policies:
+  model_acts = [act[0] for act in sorted(pred_ops.items(), key=lambda x:-x[1])]
+  added = 0
+  for i, a in enumerate(model_acts):
+    if added >= top_policies:
       break
     if a.axis >= lin.shape_len: continue
     if lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
@@ -188,6 +189,7 @@ def predict_policy(lin:Linearizer, top_policies):
         if c in {"cyan", "green", "white"}: lcl *= s
       if up > 256 or lcl > 256: continue
       acted_lins[i+1] = lin2
+      added += 1
     except Exception:
       pass
   return acted_lins
