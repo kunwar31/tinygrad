@@ -172,7 +172,7 @@ def predict_policy(lin:Linearizer, top_policies):
     sft = torch.nn.Softmax(1)
     tokens = torch.tensor(tokenize((ast, [action_to_label.get(str(opt), action_to_label[None]) for opt in applied_opts])).ids[-200:])
     raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0), None)).squeeze(0).cpu().numpy()))
-  pred_ops = {eval(op): prob for op,prob in raw.items()}
+  pred_ops = {eval(str(op)): prob for op,prob in raw.items()}
   model_acts = [act[0] for act in sorted(pred_ops.items(), key=lambda x:-x[1])]
   added = 0
   for i, a in enumerate(model_acts):
