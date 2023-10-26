@@ -176,6 +176,8 @@ def predict_policy(lin:Linearizer, top_policies):
   model_acts = [act[0] for act in sorted(pred_ops.items(), key=lambda x:-x[1])]
   added = 0
   for i, a in enumerate(model_acts):
+    if added >= top_policies:
+      break
     if a is None:
       acted_lins[i+1] = lin.copy()
       added += 1
@@ -192,8 +194,6 @@ def predict_policy(lin:Linearizer, top_policies):
       if up > 256 or lcl > 256: continue
       acted_lins[i+1] = lin2
       added += 1
-      if added >= top_policies:
-        break
     except Exception:
       pass
   return acted_lins
