@@ -209,6 +209,6 @@ def beam_search(lin: Linearizer, rawbufs, amt):
     if len(opts) == 0 or best_tm <= opts[0][1]: break  # we didn't get faster
     best_tm = opts[0][1]
     beam = [x[0] for x in opts[:amt]]
-    # step_cache[str(beam[0].ast) + '\n\n' + str(beam[0].applied_opts[:-1])] = str(beam[0].applied_opts[-1])
+    step_cache[str(beam[0].ast) + '\n\n' + str(beam[0].applied_opts[:-1])] = str(beam[0].applied_opts[-1])
     if DEBUG >= 1: print(f"{opts[0][1]*1e6:12.2f} us from {len(opts):3d} actions", beam[0].colored_shape())
   return beam[0]
