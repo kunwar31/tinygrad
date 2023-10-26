@@ -68,7 +68,7 @@ import pickle
 from tokenizers import Tokenizer
 
 tokenizer = Tokenizer.from_file('ast_tokenizer.tok')
-m = TextCNN(366, 32, 4, (30,), (3,), 59, 0.3)
+m = TextCNN(366, 32, 4, (30,), (3,), 60, 0.3)
 m.load_state_dict(torch.load('policynet.bin'))
 m = m.eval()
     
@@ -176,6 +176,8 @@ def predict_policy(lin:Linearizer, top_policies):
   model_acts = [act[0] for act in sorted(pred_ops.items(), key=lambda x:-x[1])]
   added = 0
   for i, a in enumerate(model_acts):
+    if a is None:
+      acted_lins[i+1] = lin.copy()
     if added >= top_policies:
       break
     if a.axis >= lin.shape_len: continue
