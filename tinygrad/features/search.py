@@ -202,7 +202,7 @@ def beam_search(lin: Linearizer, rawbufs, amt):
   best_tm = float('inf')
   beam: List[Linearizer] = [lin]
   while 1:
-    acted_lins = flatten([predict_policy(lin, top_policies=getenv('TOP_POLICIES', 10)).values() for lin in beam])
+    acted_lins = flatten([predict_policy(lin, top_policies=amt).values() for lin in beam])
     timed_lins = [(v,time_linearizer(v, rawbufs)) for v in acted_lins]
     opts = sorted(timed_lins, key=lambda x: x[1])
     if len(opts) == 0 or best_tm <= opts[0][1]: break  # we didn't get faster
