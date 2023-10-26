@@ -178,6 +178,7 @@ def predict_policy(lin:Linearizer, top_policies):
   for i, a in enumerate(model_acts):
     if a is None:
       acted_lins[i+1] = lin.copy()
+      added += 1
       continue
     if a.axis >= lin.shape_len: continue
     if lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
