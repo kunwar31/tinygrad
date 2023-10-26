@@ -23,6 +23,78 @@ import shelve
 logtm = shelve.open(getenv("LOGTM", "")) if getenv("LOGTM", "") else None
 step_cache = shelve.open(getenv('STEP_CACHE', './step_cache'))
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TextCNN(nn.Module):
+  def __init__(self, vocab_size, embedding_dim, n_filters, filter_sizes, kernel_sizes, output_dim, dropout, pretrained_embeddings=None):
+    super(TextCNN, self).__init__()
+    
+    if pretrained_embeddings is None:
+      self.embedding = nn.Embedding(vocab_size, embedding_dim)
+    else:
+      self.embedding = nn.Embedding.from_pretrained(pretrained_embeddings, freeze=False)
+    
+    self.convs = nn.ModuleList([
+      nn.Sequential(
+        nn.Conv1d(in_channels=embedding_dim, out_channels=fs, kernel_size=k),
+        nn.BatchNorm1d(fs),
+        nn.ReLU()
+      )
+      for fs in filter_sizes for k in kernel_sizes
+    ])
+      
+    self.fcs1 = nn.ModuleList([nn.Linear(fs, output_dim*2) for fs in filter_sizes for k in kernel_sizes])
+    self.fc2 = nn.Linear(output_dim*2, output_dim)
+    self.dropout = nn.Dropout(dropout)
+  
+  def forward(self, text, text_lens):
+    embedded = self.embedding(text)
+    embedded = embedded.permute(0, 2, 1)
+    
+    conved = [conv(embedded) for conv in self.convs]
+    
+    # Using both max and average pooling
+    max_pooled = [self.fcs1[i](F.max_pool1d(conv, conv.shape[2]).squeeze(2)) for i, conv in enumerate(conved)]
+    avg_pooled = [self.fcs1[i](F.avg_pool1d(conv, conv.shape[2]).squeeze(2)) for i, conv in enumerate(conved)]
+    fc1_out = F.relu(sum(max_pooled + avg_pooled))
+    fc1_out = self.dropout(fc1_out)
+    return self.fc2(fc1_out)
+
+import torch
+import pickle
+from tokenizers import Tokenizer
+
+tokenizer = Tokenizer.from_file('ast_tokenizer.tok')
+m = torch.load('policynet.bin').cuda()
+    
+with open('mapping.pkl', 'rb') as f:
+  vocab = pickle.load(f)
+  label_to_action = pickle.load(f)
+action_to_label = {v:k for k,v in label_to_action.items()}
+
+
+import string
+import code_tokenize as ctok
+
+def pre_tokenize(code):
+  tokens = []
+  raw = ctok.tokenize(str(code[0]), lang="python") + ctok.tokenize(str(code[1]), lang="python")
+  for tok in raw:
+    if str(tok)[-1].isdigit():
+      if '.' not in str(tok):
+        tokens.append(str(tok))
+    else:
+      if str(tok) not in string.punctuation:
+        tokens.append(str(tok))
+  return tokens
+
+def tokenize(k):
+  return tokenizer.encode(' '.join(list(map(str,pre_tokenize(k)))))
+
+
 def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=True, max_global_size=65536, cnt=3, should_copy=True, disable_cache=False) -> float:
   key = str((lin.ast, lin.applied_opts))
   if should_copy and not disable_cache and logtm is not None and key in logtm: return min(logtm[key])  # pylint: disable=E1135 # NOTE: we check should_copy since this may have side effects
@@ -91,16 +163,27 @@ def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Lineariz
       pass
   return acted_lins
 
+def predict_policy(lin:Linearizer, top_policies):
+  ast, applied_opts = lin.ast, lin.applied_opts
+  valid_ops = [x.applied_opts[-1] for x in get_linearizer_actions(lin, include_0=False).values()]
+  with torch.no_grad():
+    sft = torch.nn.Softmax(1)
+    tokens = torch.tensor(tokenize((ast, [action_to_label[opt] for opt in applied_opts])).ids[-200:])
+    raw = dict(zip(label_to_action.values(), sft(m(tokens.unsqueeze(0).cuda(), _)).squeeze(0).cpu().numpy()))
+  pred_ops = {eval(op): prob for op,prob in raw.items() if eval(op) in valid_ops}
+  s = sorted(pred_ops.items(), key=lambda x:-x[1])
+  return s[:top_policies]
+
 def beam_search(lin: Linearizer, rawbufs, amt):
   best_tm = float('inf')
   beam: List[Linearizer] = [lin]
   while 1:
-    acted_lins = flatten([get_linearizer_actions(lin, include_0=False).values() for lin in beam])
+    acted_lins = flatten([predict_policy(lin, top_policies=getenv('TOP_POLICIES', 10)) for lin in beam])
     timed_lins = [(v,time_linearizer(v, rawbufs)) for v in acted_lins]
     opts = sorted(timed_lins, key=lambda x: x[1])
     if len(opts) == 0 or best_tm <= opts[0][1]: break  # we didn't get faster
     best_tm = opts[0][1]
     beam = [x[0] for x in opts[:amt]]
-    step_cache[str(beam[0].ast) + '\n\n' + str(beam[0].applied_opts[:-1])] = str(beam[0].applied_opts[-1])
+    # step_cache[str(beam[0].ast) + '\n\n' + str(beam[0].applied_opts[:-1])] = str(beam[0].applied_opts[-1])
     if DEBUG >= 1: print(f"{opts[0][1]*1e6:12.2f} us from {len(opts):3d} actions", beam[0].colored_shape())
   return beam[0]
