@@ -68,7 +68,7 @@ import pickle
 from tokenizers import Tokenizer
 
 tokenizer = Tokenizer.from_file('ast_tokenizer.tok')
-m = TextCNN(366, 32, 4, (30,), (3,), 60, 0.3)
+m = TextCNN(746, 256, 4, (61,), (3,), 61, 0.0)
 m.load_state_dict(torch.load('policynet.bin'))
 m = m.eval()
     
