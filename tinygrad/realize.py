@@ -1,6 +1,6 @@
 from typing import List, Dict, Optional
 from tinygrad.ops import LoadOps, ScheduleItem
-from tinygrad.device import Device, Buffer, BufferCopy, JITRunner
+from tinygrad.device import Device, Buffer, Buffer4Bit, BufferCopy, JITRunner
 from tinygrad.graph import log_schedule_item, print_tree
 from tinygrad.helpers import prod
 from tinygrad.shape.symbolic import Variable
@@ -34,4 +34,14 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
     for v in si.out.views: del v.op
 
     # run the function (put it in JIT)
-    if prg: prg.exec([si.out.realized] + [x.realized for x in si.inputs], si.var_vals)
+    converted_inputs = []
+    to_del = []
+    for idx, buffer in enumerate(si.inputs):
+      if isinstance(buffer.realized, Buffer4Bit):
+        converted_inputs.append(buffer.realized.asBuffer())
+        to_del.append(idx)
+      else:
+        converted_inputs.append(buffer.realized)
+    if prg: prg.exec([si.out.realized] + converted_inputs, si.var_vals)
+    for idx in to_del:
+      del converted_inputs[idx]

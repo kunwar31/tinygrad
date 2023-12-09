@@ -98,11 +98,53 @@ class Buffer:
     ret = np.empty(self.size, self.dtype.np)
     if self.size > 0: self.allocator.copyout(flat_mv(ret.data), self._buf)
     return ret
+  
+class Buffer4Bit:
+  def __init__(self, device:str, alloc_size:int, alloc_dtype:DType, actual_data:np.ndarray, opaque:Any=None):
+    assert isinstance(alloc_dtype, DType)
+    self.device, self.alloc_size, self.alloc_dtype = device, alloc_size, alloc_dtype
+    self.size, self.dtype = ((alloc_size//18)*16)*2, dtypes.half
+    self.allocator = Device['CLANG'].allocator
+    self._buf = opaque if opaque is not None else self.allocator.alloc(alloc_size * alloc_dtype.itemsize)
+    # TODO: mem_used for all devices
+    if self.device == Device.DEFAULT: GlobalCounters.mem_used += self.alloc_size * self.alloc_dtype.itemsize
+    self.actual_data = actual_data
+  def __del__(self):
+    if self.device == Device.DEFAULT: GlobalCounters.mem_used -= self.alloc_size * self.alloc_dtype.itemsize
+    if isinstance(self.alloc_dtype, ImageDType):
+      self.allocator._free(self._buf)
+      self.allocator.free(self._real_buf, self.alloc_size * self.alloc_dtype.itemsize)
+    else:
+      self.allocator.free(self._buf, self.alloc_size * self.alloc_dtype.itemsize)
+  def __repr__(self): return f"<4bitbuf device:{self.device} size:{self.size} dtype:{self.dtype}>"
+  def copyin(self, mv:memoryview):
+    mv = flat_mv(mv)
+    assert len(mv) == self.alloc_size*self.alloc_dtype.itemsize, f"size mismatch, {len(mv)=} != {self.alloc_dtype=} {self.alloc_size=}"
+    self.allocator.copyin(self._buf, mv)
+    return self
+  @staticmethod
+  def fromCPU(device:str, x:np.ndarray): 
+    x = x.reshape((-1, 18))
+    byte_array = x[:, 2:].astype(np.int32)
+    d = x[:, :2].view(np.float16)
+    x0 = (byte_array & 0x0F) - 8
+    x1 = (byte_array >> 4) - 8
+    processed_blocks = np.concatenate([x0, x1], axis=1).astype(np.int8) * d     
+    ret = Buffer4Bit(device, x.size,  dtypes.from_np(x.dtype), actual_data=processed_blocks).copyin(x.data)
+    return ret
+  def toCPU(self) -> np.ndarray:
+    return self.actual_data
+  def asBuffer(self):
+    return Buffer.fromCPU(self.device, self.toCPU())
 
 class _BufferCopy(JITRunner):
   # TODO: make wait work
   def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False):
     dest, src = rawbufs
+    if isinstance(dest, Buffer4Bit):
+      dest = dest.asBuffer()
+    if isinstance(src, Buffer4Bit):
+      src = src.asBuffer()
     assert dest.size == src.size and dest.dtype == src.dtype, "buffer copy size/dtype mismatch"
     if DEBUG >= 2: print(f"***      copy {dest.device} <- {src.device} size {dest.size:<16d} dtype {dest.dtype}")
     if hasattr(dest.allocator, 'transfer') and type(dest.allocator) is type(src.allocator):
@@ -144,7 +186,8 @@ class LRUAllocator(Allocator):  # pylint: disable=abstract-method
     if len(c := self.cache[size]): return c.pop()
     try:
       return super().alloc(size)
-    except MemoryError:
+    except:
+      print('freeing cache')
       self.free_cache()
       return super().alloc(size)
   def free_cache(self):

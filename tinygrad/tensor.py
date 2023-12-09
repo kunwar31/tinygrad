@@ -682,10 +682,20 @@ class Tensor:
   def _to_float(self, x:Union[Tensor, float]):
     return x.lazydata.base.op.arg if isinstance(x, Tensor) and x.lazydata.is_unrealized_contiguous_const() \
       and not x.requires_grad and self._broadcasted(x)[0].shape == self.shape else x
+  
+  def _to_int(self, x:Union[Tensor, int]):
+    return x.lazydata.base.op.arg if isinstance(x, Tensor) and x.lazydata.is_unrealized_contiguous_const() \
+      and not x.requires_grad and self._broadcasted(x)[0].shape == self.shape else x
 
   def add(self, x:Union[Tensor, float], reverse=False) -> Tensor:
     x = self._to_float(x)
     return mlops.Add.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x else self
+  
+  def mod(self, x:Union[Tensor, int], reverse=False) -> Tensor:
+    x = self._to_int(x)
+    self = self.cast(dtypes.int)
+    return mlops.Mod.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x else self
+
   def sub(self, x:Union[Tensor, float], reverse=False) -> Tensor:
     x = self._to_float(x)
     return mlops.Sub.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x else (-self if reverse else self)
@@ -731,7 +741,7 @@ class Tensor:
   # ***** op wrappers (wasted lines to make the typechecker happy) *****
 
   def __neg__(self) -> Tensor: return self.neg()
-
+  def __mod__(self, x) -> Tensor: return self.mod(x)
   def __add__(self, x) -> Tensor: return self.add(x)
   def __sub__(self, x) -> Tensor: return self.sub(x)
   def __mul__(self, x) -> Tensor: return self.mul(x)
