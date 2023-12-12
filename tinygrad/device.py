@@ -116,10 +116,6 @@ class _BufferCopy(JITRunner):
   # TODO: make wait work
   def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False):
     dest, src = rawbufs
-    # if isinstance(dest, Buffer4Bit):
-    #   dest = dest.asBuffer()
-    # if isinstance(src, Buffer4Bit):
-    #   src = src.asBuffer()
     assert dest.size == src.size and dest.dtype == src.dtype, "buffer copy size/dtype mismatch"
     st = time.perf_counter()
     _internal_buffer_copy(dest, src)
@@ -149,8 +145,7 @@ class LRUAllocator(Allocator):  # pylint: disable=abstract-method
     if len(c := self.cache[size]): return c.pop()
     try:
       return super().alloc(size)
-    except:
-      print('freeing cache')
+    except MemoryError:
       self.free_cache()
       return super().alloc(size)
   def free_cache(self):
