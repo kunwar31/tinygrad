@@ -88,26 +88,6 @@ class Buffer:
     ret = np.empty(self.size, self.dtype.np)
     if self.size > 0: self.allocator.copyout(flat_mv(ret.data), self._buf)
     return ret
-  
-class Buffer4Bit(Buffer):
-  def __repr__(self): return f"<4bit-buf device:{self.device} size:{self.size} dtype:{self.dtype}>"
-  @staticmethod
-  def fromCPU(device:str, x:np.ndarray): return Buffer4Bit(device, x.size, dtypes.from_np(x.dtype)).copyin(x.data)
-  def toCPU(self) -> np.ndarray:
-    # zero copy with as_buffer
-    if hasattr(self.allocator, 'as_buffer'): ret = np.frombuffer(self.allocator.as_buffer(self._buf), dtype=np.dtype(self.dtype.np, metadata={"backing": self._buf}))  # type: ignore
-    else:
-      ret = np.empty(self.size, self.dtype.np)
-      if self.size > 0: self.allocator.copyout(flat_mv(ret.data), self._buf)
-    x = ret.reshape((-1, 18))
-    byte_array = x[:, 2:].astype(np.int32)
-    d = x[:, :2].view(np.float16)
-    x0 = (byte_array & 0x0F) - 8
-    x1 = (byte_array >> 4) - 8
-    processed_blocks = np.concatenate([x0, x1], axis=1).astype(np.int8) * d 
-    return processed_blocks.reshape(-1)
-  def asBuffer(self):
-    return Buffer(self.device, self.size, self.dtype, self._buf)
 
 def _internal_buffer_copy(dest, src):
   if hasattr(dest.allocator, 'transfer') and type(dest.allocator) is type(src.allocator):
@@ -140,7 +120,6 @@ class _BufferCopy(JITRunner):
     #   dest = dest.asBuffer()
     # if isinstance(src, Buffer4Bit):
     #   src = src.asBuffer()
-    print(src, dest)
     assert dest.size == src.size and dest.dtype == src.dtype, "buffer copy size/dtype mismatch"
     st = time.perf_counter()
     _internal_buffer_copy(dest, src)

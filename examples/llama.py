@@ -17,6 +17,49 @@ from sentencepiece import SentencePieceProcessor
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
 
+class AbsmaxQuantizedLinear:
+  def __init__(self, in_features, out_features, bias=False):
+    assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
+    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
+
+  def __call__(self, x):
+    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
+
+  @staticmethod
+  def quantize(tensors):
+    new_tensors = {}
+    for name,v in tensors.items():
+      if "feed_forward" in name or ("attention.w") in name or name == "output.weight":
+        scale = v.abs().max(axis=1) / 127.0
+        int8_weight = (v.T/scale).T.cast(dtype=dtypes.int8)
+        new_tensors[name] = int8_weight
+        new_tensors[name.replace('weight', 'scale')] = scale
+      else:
+        new_tensors[name] = v
+    return new_tensors
+
+class QK4_0Linear:
+  def __init__(self, in_features, out_features, bias=False):
+    assert bias == False
+    self.in_features = in_features
+    self.out_features = out_features
+    dim = out_features * in_features
+    # each block stores 32 weights
+    assert dim % 32 == 0
+    n_blocks = dim // 32
+    self.weight = Tensor.ones(n_blocks, 16, dtype=dtypes.uint8)
+    self.scale = Tensor.ones(n_blocks, 1, dtype=dtypes.half)
+    
+  def dequantize(self):
+    x0 = ((self.weight % 16).cast(dtypes.int16) - 8)
+    x1 = ((self.weight / 16).cast(dtypes.int16) - 8)
+    processed_blocks = Tensor.cat(x0, x1, dim=1) * self.scale
+    return processed_blocks.reshape((self.in_features, self.out_features))
+
+  def __call__(self, x):
+    return x.dot(self.dequantize())
+
 # calculating params:
 # traditionally, the MLP in the transformer architecture has hidden_dim = dim*4 [arxiv/1706.03762, 3.3]
 # however, Llama uses SwiGLU. in order to preserve param count to original transformer arch, hidden_dim must be = 2/3 * (dim*4) [arxiv/2002.05202]
@@ -101,6 +144,12 @@ MODEL_PARAMS = {
       "args": {"dim": 2048, "n_layers": 22, "n_heads": 32, "n_kv_heads": 4, "norm_eps": 1e-05, "vocab_size": 32003, "hidden_dim": 5632},
       "files": 1,
     }
+  },
+  "GGUF": {
+    "7B-QK4-0": {
+      "args": {"dim": 4096, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": 32000, "hidden_dim": 11008, "linear": QK4_0Linear},
+      "files": 1
+    }
   }
 }
 
@@ -126,44 +175,20 @@ def load(fn:str):
   else:
     return torch_load(fn)
 
-class AbsmaxQuantizedLinear:
-  def __init__(self, in_features, out_features, bias=False):
-    assert bias == False
-    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
-    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
+def get_fp16_weights_from_q4_0(gguf_tensor_data, shape):
+    gguf_tensor_data = gguf_tensor_data.reshape((-1, 18))
+    bytearr = Tensor(gguf_tensor_data[:, 2:])
+    d = Tensor(gguf_tensor_data[:, :2].view(np.float16)) 
+    x0 = ((bytearr % 16).cast(dtypes.int16) - 8)
+    x1 = ((bytearr / 16).cast(dtypes.int16) - 8)
+    processed_blocks = Tensor.cat(x0, x1, dim=1) * d
+    return processed_blocks.reshape(shape)
 
-  def __call__(self, x):
-    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
-
-  @staticmethod
-  def quantize(tensors):
-    new_tensors = {}
-    for name,v in tensors.items():
-      if "feed_forward" in name or ("attention.w") in name or name == "output.weight":
-        scale = v.abs().max(axis=1) / 127.0
-        int8_weight = (v.T/scale).T.cast(dtype=dtypes.int8)
-        new_tensors[name] = int8_weight
-        new_tensors[name.replace('weight', 'scale')] = scale
-      else:
-        new_tensors[name] = v
-    return new_tensors
-  
-from tinygrad.device import Buffer4Bit, Device
-from tinygrad.lazy import LazyBuffer, ShapeTracker, LoadOps
-from tinygrad.helpers import dtypes
-from tinygrad import Tensor
-
-def load_gguf_4bittensor(tensor):
-    rawbuf = Buffer4Bit.fromCPU(device=Device.DEFAULT, x=np.array(tensor.data))
-    lazybuf = LazyBuffer("GPU",
-           ShapeTracker.from_shape(tuple(tensor.shape.tolist())),
-           LoadOps,
-           None,
-           dtypes.half,
-           rawbuf)
-    return Tensor(lazybuf)
-
-
+def get_weight_and_scale_from_qk4(tensor):
+    blocks = tensor.reshape(-1, 18)
+    weight = blocks[:, 2:]
+    scale = blocks[:, :2].view(np.float16)
+    return Tensor(weight), Tensor(scale)
 
 def get_fp16_weights_from_q6_k(gguf_tensor_data, shape, k=256):
     gguf_tensor_data = gguf_tensor_data.reshape((-1, 210))
@@ -188,6 +213,41 @@ def get_fp16_weights_from_q6_k(gguf_tensor_data, shape, k=256):
 
     y = np.concatenate(vals, axis=1).reshape(shape)
     return Tensor(y)
+  
+def load_gguf(fn: str, nm_layers: int = 100):
+  import gguf
+  model = gguf.GGUFReader(path=fn)
+  tensor_dict = {}
+  gguf_to_tinygrad_keymap = {
+      'token_embd.weight': 'tok_embeddings.weight',
+      **{f"blk.{i}.attn_norm.weight": f"layers.{i}.attention_norm.weight" for i in range(nm_layers)},
+      **{f"blk.{i}.attn_{v}.weight": f"layers.{i}.attention.w{v[0]}.weight" for v in ["q", "k", "v", "output"] for i in range(nm_layers)},
+      **{f"blk.{i}.ffn_norm.weight": f"layers.{i}.ffn_norm.weight" for i in range(nm_layers)},
+      **{f"blk.{i}.ffn_{x}.weight": f"layers.{i}.feed_forward.w{y}.weight" for x,y in {"gate": 1, "down": 2, "up": 3}.items() for i in range(nm_layers)},
+      'output_norm.weight': 'norm.weight', 'output.weight': 'output.weight',
+  }
+  for idx in (range(len(model.tensors))):
+    k = gguf_to_tinygrad_keymap[model.tensors[idx].field.name]
+    if model.tensors[idx].tensor_type.name == 'Q4_0':
+      if 'embedding' not in k:
+        weight, scale = get_weight_and_scale_from_qk4(model.tensors[idx].data)
+      else:
+        weight, scale = get_fp16_weights_from_q4_0(model.tensors[idx].data, model.tensors[idx].shape.tolist()), None
+    elif model.tensors[idx].tensor_type.name == 'Q6_K':
+      weight, scale = get_fp16_weights_from_q6_k(model.tensors[idx].data, model.tensors[idx].shape.tolist()), None
+    elif model.tensors[idx].tensor_type.name == 'F32':
+      weight, scale = Tensor(np.asarray(model.tensors[idx].data)).cast(dtypes.half), None
+    else:
+      print('not implemented', model.tensors[idx].tensor_type.name)
+      continue
+    if "tok_embeddings.weight" in k:
+      weight = weight.T
+    elif "output.weight" in k:
+      weight = weight.T
+    tensor_dict[k] = weight
+    if scale is not None:
+      tensor_dict[k.replace('.weight', '.scale')] = scale
+  return tensor_dict
 
 class LLaMa:
   @staticmethod
@@ -196,63 +256,24 @@ class LLaMa:
     sp_model = SentencePieceProcessor(model_file=str(tokenizer_path))
     assert sp_model.vocab_size() == params["args"]["vocab_size"], f"{sp_model.vocab_size()=} not equal to {params['args']['vocab_size']}"
 
-    llama = Transformer(**{"dim": 4096, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": 32000, "hidden_dim": 11008})
-    tensor_dict = {}
-    gguf_to_tinygrad_keymap = {
-        'token_embd.weight': 'tok_embeddings.weight',
-        **{f"blk.{i}.attn_norm.weight": f"layers.{i}.attention_norm.weight" for i in range(len(llama.layers))},
-        **{f"blk.{i}.attn_{v}.weight": f"layers.{i}.attention.w{v[0]}.weight" for v in ["q", "k", "v", "output"] for i in range(len(llama.layers))},
-        **{f"blk.{i}.ffn_norm.weight": f"layers.{i}.ffn_norm.weight" for i in range(len(llama.layers))},
-        **{f"blk.{i}.ffn_{x}.weight": f"layers.{i}.feed_forward.w{y}.weight" for x,y in {"gate": 1, "down": 2, "up": 3}.items() for i in range(len(llama.layers))},
-        'output_norm.weight': 'norm.weight',
-        'output.weight': 'output.weight',
-    }
-    
-    # model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear, max_context=MAX_CONTEXT) if quantize else Transformer(**params["args"], max_context=MAX_CONTEXT)
+    model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear, max_context=MAX_CONTEXT) if quantize else Transformer(**params["args"], max_context=MAX_CONTEXT)
 
-    # if model_path.is_dir():
-    #   weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
-    # else:
-    #   weights = load(str(model_path))
-    # if "model.embed_tokens.weight" in weights:
-    #   weights = convert_from_huggingface(weights, model, params["args"]["n_heads"], params["args"].get("n_kv_heads", params["args"]["n_heads"]))
+    if model_gen == 'GGUF':
+      weights = load_gguf(model_path)
+    else:
+      if model_path.is_dir():
+        weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
+      else:
+        weights = load(str(model_path))
+      if "model.embed_tokens.weight" in weights:
+        weights = convert_from_huggingface(weights, model, params["args"]["n_heads"], params["args"].get("n_kv_heads", params["args"]["n_heads"]))
 
-    # if quantize:
-    #   weights = AbsmaxQuantizedLinear.quantize(weights)
-    #   for _,v in weights.items(): v.realize()
-    # load_state_dict(model, weights, strict=False)
-    def permute(v: Tensor, n_heads: int):
-      return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1]).transpose(1, 2).reshape(*v.shape[:2])
-    import gguf
-    model = gguf.GGUFReader(path='/home/kunwar31/.cache/huggingface/hub/models--TheBloke--Llama-2-7B-GGUF/blobs/78b8f9777dd620ad29cd2cffb6653b17fa8a5b1fddc1b8821180d60eedd24d48')
-    for idx in (range(len(model.tensors))):
-        tensor_data = model.tensors[idx].data
-        shape = model.tensors[idx].shape.tolist()
-        if model.tensors[idx].tensor_type.name == 'Q4_0':
-            out = load_gguf_4bittensor(model.tensors[idx])
-        elif model.tensors[idx].tensor_type.name == 'Q6_K':
-            out = get_fp16_weights_from_q6_k(tensor_data, shape)
-        elif model.tensors[idx].tensor_type.name == 'F32':
-            out = Tensor(np.asarray(tensor_data)).cast(dtypes.half)
-        else:
-            print('not implemented', model.tensors[idx].tensor_type.name)
-            continue
-        k = gguf_to_tinygrad_keymap[model.tensors[idx].field.name]
-        if "layers." in k:
-            if "attention.wq" in k:
-                out = permute(out, 32)
-            elif "attention.wk" in k:
-                out = permute(out, 32)
-            elif "feed_forward.w" in k:
-                out = out.T
-        elif "tok_embeddings.weight" in k:
-            out = out.T
-        elif "output.weight" in k:
-            out = out.T
-        tensor_dict[k] = out
-    load_state_dict(llama, tensor_dict, strict=False)
+      if quantize:
+        weights = AbsmaxQuantizedLinear.quantize(weights)
+        for _,v in weights.items(): v.realize()
+    load_state_dict(model, weights, strict=False)
 
-    return LLaMa(llama, sp_model)
+    return LLaMa(model, sp_model)
 
   def __init__(self, model, tokenizer):
     self.model = model
@@ -445,7 +466,7 @@ After you are done speaking, output [EOS]. You are not Chad.
 
   # *** prompt engineers stop here ****
 
-  LLAMA_SUFFIX = {"1": "", "2": "-2", "code": "-code", "tiny": "-tiny"}[args.gen]
+  LLAMA_SUFFIX = {"1": "", "2": "-2", "code": "-code", "tiny": "-tiny", "GGUF": "GGUF"}[args.gen]
   MODEL_PATH = args.model or Path(__file__).parents[1] / f"weights/LLaMA{LLAMA_SUFFIX}/{args.size}"
   TOKENIZER_PATH = (MODEL_PATH if MODEL_PATH.is_dir() else MODEL_PATH.parent) / "tokenizer.model"
   print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
