@@ -13,7 +13,9 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters
 from tinygrad.helpers import GlobalCounters
 from extra.models.llama import Transformer, convert_from_huggingface
-from sentencepiece import SentencePieceProcessor
+from sentencepiece import SentencePieceProcessor, sentencepiece_model_pb2
+import gguf
+from gguf.constants import GGMLQuantizationType
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
 
@@ -50,7 +52,7 @@ class QK4_0Linear:
     n_blocks = dim // 32
     self.weight = Tensor.ones(n_blocks, 16, dtype=dtypes.uint8)
     self.scale = Tensor.ones(n_blocks, 1, dtype=dtypes.half)
-    
+
   def dequantize(self):
     x0 = ((self.weight % 16).cast(dtypes.int16) - 8)
     x1 = ((self.weight / 16).cast(dtypes.int16) - 8)
@@ -178,7 +180,7 @@ def load(fn:str):
 def get_fp16_weights_from_q4_0(gguf_tensor_data, shape):
     gguf_tensor_data = gguf_tensor_data.reshape((-1, 18))
     bytearr = Tensor(gguf_tensor_data[:, 2:])
-    d = Tensor(gguf_tensor_data[:, :2].view(np.float16)) 
+    d = Tensor(gguf_tensor_data[:, :2].view(np.float16))
     x0 = ((bytearr % 16).cast(dtypes.int16) - 8)
     x1 = ((bytearr / 16).cast(dtypes.int16) - 8)
     processed_blocks = Tensor.cat(x0, x1, dim=1) * d
@@ -213,9 +215,32 @@ def get_fp16_weights_from_q6_k(gguf_tensor_data, shape, k=256):
 
     y = np.concatenate(vals, axis=1).reshape(shape)
     return Tensor(y)
-  
-def load_gguf(fn: str, nm_layers: int = 100):
-  import gguf
+
+def load_gguf_tokenizer(fn: str):
+  reader = gguf.GGUFReader(fn, 'r')
+  tokens = [str(bytes(reader.fields['tokenizer.ggml.tokens'].parts[idx]), encoding="utf-8") for idx in reader.fields['tokenizer.ggml.tokens'].data]
+  scores = [pv for idx in reader.fields['tokenizer.ggml.scores'].data for pv in reader.fields['tokenizer.ggml.scores'].parts[idx].tolist()]
+  types  = [pv for idx in reader.fields['tokenizer.ggml.token_type'].data for pv in reader.fields['tokenizer.ggml.token_type'].parts[idx].tolist()]
+
+  # Model tokens for Sentence Piece use Google's Protocol Buffer
+  token_model = sentencepiece_model_pb2.ModelProto()
+  for i in range(len(tokens)):
+    token = token_model.pieces.add()
+    token.piece = tokens[i]
+    token.score = scores[i]
+    token.type  = types[i]
+    if token.type == gguf.TokenType.BYTE:
+      token_model.trainer_spec.byte_fallback = 1
+
+  token_model.trainer_spec.unk_id = reader.fields['tokenizer.ggml.unknown_token_id'].parts[-1][0]
+  token_model.trainer_spec.bos_id = reader.fields['tokenizer.ggml.bos_token_id'].parts[-1][0]
+  token_model.trainer_spec.eos_id = reader.fields['tokenizer.ggml.eos_token_id'].parts[-1][0]
+  # Load the model from the Protocol Buffer created with the .gguf info
+  sp = SentencePieceProcessor()
+  sp.load_from_serialized_proto(token_model.SerializeToString())
+  return sp
+
+def load_gguf_weights(fn: str, nm_layers: int = 100):
   model = gguf.GGUFReader(path=fn)
   tensor_dict = {}
   gguf_to_tinygrad_keymap = {
@@ -226,19 +251,19 @@ def load_gguf(fn: str, nm_layers: int = 100):
       **{f"blk.{i}.ffn_{x}.weight": f"layers.{i}.feed_forward.w{y}.weight" for x,y in {"gate": 1, "down": 2, "up": 3}.items() for i in range(nm_layers)},
       'output_norm.weight': 'norm.weight', 'output.weight': 'output.weight',
   }
-  for idx in (range(len(model.tensors))):
-    k = gguf_to_tinygrad_keymap[model.tensors[idx].field.name]
-    if model.tensors[idx].tensor_type.name == 'Q4_0':
+  for tensor in (model.tensors):
+    k = gguf_to_tinygrad_keymap[tensor.field.name]
+    if tensor.tensor_type == GGMLQuantizationType.Q4_0:
       if 'embedding' not in k:
-        weight, scale = get_weight_and_scale_from_qk4(model.tensors[idx].data)
+        weight, scale = get_weight_and_scale_from_qk4(tensor.data)
       else:
-        weight, scale = get_fp16_weights_from_q4_0(model.tensors[idx].data, model.tensors[idx].shape.tolist()), None
-    elif model.tensors[idx].tensor_type.name == 'Q6_K':
-      weight, scale = get_fp16_weights_from_q6_k(model.tensors[idx].data, model.tensors[idx].shape.tolist()), None
-    elif model.tensors[idx].tensor_type.name == 'F32':
-      weight, scale = Tensor(np.asarray(model.tensors[idx].data)).cast(dtypes.half), None
+        weight, scale = get_fp16_weights_from_q4_0(tensor.data, tensor.shape.tolist()), None
+    elif tensor.tensor_type == GGMLQuantizationType.Q6_K:
+      weight, scale = get_fp16_weights_from_q6_k(tensor.data, tensor.shape.tolist()), None
+    elif tensor.tensor_type == GGMLQuantizationType.F32:
+      weight, scale = Tensor(np.asarray(tensor.data)).cast(dtypes.half), None
     else:
-      print('not implemented', model.tensors[idx].tensor_type.name)
+      print('not implemented', tensor.tensor_type.name)
       continue
     if "tok_embeddings.weight" in k:
       weight = weight.T
@@ -253,13 +278,13 @@ class LLaMa:
   @staticmethod
   def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=False):
     params = MODEL_PARAMS[model_gen][model_size]
-    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path))
+    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path)) if model_gen != 'GGUF' else load_gguf_tokenizer(model_path)
     assert sp_model.vocab_size() == params["args"]["vocab_size"], f"{sp_model.vocab_size()=} not equal to {params['args']['vocab_size']}"
 
     jit = bool(getenv("JIT", 1))
     model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear, max_context=MAX_CONTEXT, jit=jit) if quantize else Transformer(**params["args"], max_context=MAX_CONTEXT, jit=jit)
     if model_gen == 'GGUF':
-      weights = load_gguf(model_path)
+      weights = load_gguf_weights(model_path)
     else:
       if model_path.is_dir():
         weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
