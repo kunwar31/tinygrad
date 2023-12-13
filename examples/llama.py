@@ -15,6 +15,7 @@ from tinygrad.helpers import GlobalCounters
 from extra.models.llama import Transformer, convert_from_huggingface
 from sentencepiece import SentencePieceProcessor, sentencepiece_model_pb2
 import gguf
+from tqdm import tqdm
 from gguf.constants import GGMLQuantizationType
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
@@ -54,10 +55,14 @@ class QK4_0Linear:
     self.scale = Tensor.ones(n_blocks, 1, dtype=dtypes.half)
 
   def dequantize(self):
-    x0 = ((self.weight % 16).cast(dtypes.int16) - 8)
-    x1 = ((self.weight / 16).cast(dtypes.int16) - 8)
-    processed_blocks = Tensor.cat(x0, x1, dim=1) * self.scale
-    return processed_blocks.reshape((self.in_features, self.out_features))
+    if getenv('USE_MOD', 0):
+      return (
+        (Tensor.cat(self.weight % 16, self.weight / 16, dim=1).cast(dtypes.int8) - 8) * self.scale
+      ).reshape((self.in_features, self.out_features))
+    div = (self.weight / 16)
+    return (
+        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * self.scale
+      ).reshape((self.in_features, self.out_features))
 
   def __call__(self, x):
     return x.dot(self.dequantize())
@@ -180,11 +185,9 @@ def load(fn:str):
 def get_fp16_weights_from_q4_0(gguf_tensor_data, shape):
     gguf_tensor_data = gguf_tensor_data.reshape((-1, 18))
     bytearr = Tensor(gguf_tensor_data[:, 2:])
-    d = Tensor(gguf_tensor_data[:, :2].view(np.float16))
-    x0 = ((bytearr % 16).cast(dtypes.int16) - 8)
-    x1 = ((bytearr / 16).cast(dtypes.int16) - 8)
-    processed_blocks = Tensor.cat(x0, x1, dim=1) * d
-    return processed_blocks.reshape(shape)
+    d = Tensor(gguf_tensor_data[:, :2].view(np.float16)) 
+    processed_blocks = (Tensor.cat(bytearr % 16, bytearr / 16, dim=1).cast(dtypes.int8) - 8) * d
+    return processed_blocks.reshape(shape).T
 
 def get_weight_and_scale_from_qk4(tensor):
     blocks = tensor.reshape(-1, 18)
@@ -205,16 +208,16 @@ def get_fp16_weights_from_q6_k(gguf_tensor_data, shape, k=256):
         ql_idx = n*64
         qh_idx = n*32
         scales_idx = n*8
-        q.append(((ql[:, ql_idx:32+ql_idx] % 16) | ((qh[:, qh_idx:32+qh_idx] >> 0) % 4) << 4).astype(np.int8) - 32)
-        q.append(((ql[:, ql_idx+32:64+ql_idx] % 16) | ((qh[:, qh_idx:32+qh_idx] >> 2) % 4) << 4).astype(np.int8) - 32)
-        q.append(((ql[:, ql_idx:32+ql_idx] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 4) % 4) << 4).astype(np.int8) - 32)
-        q.append(((ql[:, ql_idx+32:ql_idx+64] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 6) % 4) << 4).astype(np.int8) - 32)
+        q.append(((ql[:, ql_idx:32+ql_idx] & 0xF) | ((qh[:, qh_idx:32+qh_idx] >> 0) & 3) << 4).astype(np.int8) - 32)
+        q.append(((ql[:, ql_idx+32:64+ql_idx] & 0xF) | ((qh[:, qh_idx:32+qh_idx] >> 2) & 3) << 4).astype(np.int8) - 32)
+        q.append(((ql[:, ql_idx:32+ql_idx] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 4) & 3) << 4).astype(np.int8) - 32)
+        q.append(((ql[:, ql_idx+32:ql_idx+64] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 6) & 3) << 4).astype(np.int8) - 32)
         for i in range(8):
             qval = q[i//2][:, :16] if i % 2 == 0 else q[i//2][:, 16:]
             vals.append(d * scales[i+scales_idx] * qval)
 
     y = np.concatenate(vals, axis=1).reshape(shape)
-    return Tensor(y)
+    return Tensor(y).T
 
 def load_gguf_tokenizer(fn: str):
   reader = gguf.GGUFReader(fn, 'r')
@@ -251,7 +254,7 @@ def load_gguf_weights(fn: str, nm_layers: int = 100):
       **{f"blk.{i}.ffn_{x}.weight": f"layers.{i}.feed_forward.w{y}.weight" for x,y in {"gate": 1, "down": 2, "up": 3}.items() for i in range(nm_layers)},
       'output_norm.weight': 'norm.weight', 'output.weight': 'output.weight',
   }
-  for tensor in (model.tensors):
+  for tensor in tqdm(model.tensors):
     k = gguf_to_tinygrad_keymap[tensor.field.name]
     if tensor.tensor_type == GGMLQuantizationType.Q4_0:
       if 'embedding' not in k:
@@ -261,14 +264,10 @@ def load_gguf_weights(fn: str, nm_layers: int = 100):
     elif tensor.tensor_type == GGMLQuantizationType.Q6_K:
       weight, scale = get_fp16_weights_from_q6_k(tensor.data, tensor.shape.tolist()), None
     elif tensor.tensor_type == GGMLQuantizationType.F32:
-      weight, scale = Tensor(np.asarray(tensor.data)).cast(dtypes.half), None
+      weight, scale = Tensor(np.asarray(tensor.data).astype(np.float16)), None
     else:
       print('not implemented', tensor.tensor_type.name)
       continue
-    if "tok_embeddings.weight" in k:
-      weight = weight.T
-    elif "output.weight" in k:
-      weight = weight.T
     tensor_dict[k] = weight
     if scale is not None:
       tensor_dict[k.replace('.weight', '.scale')] = scale
