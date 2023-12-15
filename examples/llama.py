@@ -20,6 +20,18 @@ from gguf.constants import GGMLQuantizationType
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
 
+def _quantize(tensor):
+  blocks = tensor.reshape(-1, 32)
+  weights = Tensor.zeros(blocks.shape[0], 16, dtype=dtypes.uint8)
+  _min, _max = blocks.min(axis=1), blocks.max(axis=1)
+  out = (_min.abs() > _max).where(_min, _max)
+  d = out / -8
+  _id = d.where(d.reciprocal(), Tensor.zeros_like(d))
+  x = (((blocks * _id.unsqueeze(1)) + 8.5).clip(0, 15)).cast(dtypes.uint8)
+  weights = weights.xor(x[:, :16])
+  weights = weights.xor(x[:, 16:] * 16)
+  return weights, d.unsqueeze(1)
+
 class AbsmaxQuantizedLinear:
   def __init__(self, in_features, out_features, bias=False):
     assert bias == False
@@ -27,7 +39,7 @@ class AbsmaxQuantizedLinear:
     self.scale = Tensor.ones(out_features, dtype=dtypes.half)
 
   def __call__(self, x):
-    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
+    return x.dot(self.weight.T.half()*self.scale)
 
   @staticmethod
   def quantize(tensors):
@@ -54,6 +66,17 @@ class QK4_0Linear:
     self.weight = Tensor.ones(n_blocks, 16, dtype=dtypes.uint8)
     self.scale = Tensor.ones(n_blocks, 1, dtype=dtypes.half)
 
+  def quantize(tensors):
+    new_tensors = {}
+    for name,v in tensors.items():
+      if "feed_forward" in name or ("attention.w") in name or name == "output.weight":
+        weight, scale = _quantize(v)
+        new_tensors[name] = weight
+        new_tensors[name.replace('weight', 'scale')] = scale.half()
+      else:
+        new_tensors[name] = v
+    return new_tensors
+
   def dequantize(self):
     if getenv('USE_MOD', 0):
       return (
@@ -61,11 +84,11 @@ class QK4_0Linear:
       ).reshape((self.in_features, self.out_features))
     div = (self.weight / 16)
     return (
-        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * self.scale
+        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8).half() * self.scale
       ).reshape((self.in_features, self.out_features))
 
   def __call__(self, x):
-    return x.dot(self.dequantize())
+    return x.dot(self.dequantize().realize())
 
 # calculating params:
 # traditionally, the MLP in the transformer architecture has hidden_dim = dim*4 [arxiv/1706.03762, 3.3]
@@ -156,6 +179,10 @@ MODEL_PARAMS = {
     "7B-QK4-0": {
       "args": {"dim": 4096, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": 32000, "hidden_dim": 11008, "linear": QK4_0Linear},
       "files": 1
+    },
+    "1B-chat-QK4-0": {
+      "args": {"dim": 2048, "n_layers": 22, "n_heads": 32, "n_kv_heads": 4, "norm_eps": 1e-05, "vocab_size": 32003, "hidden_dim": 5632, "linear": QK4_0Linear},
+      "files": 1
     }
   }
 }
@@ -214,12 +241,13 @@ def get_fp16_weights_from_q6_k(gguf_tensor_data, shape, k=256):
         q.append(((ql[:, ql_idx+32:ql_idx+64] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 6) & 3) << 4).astype(np.int8) - 32)
         for i in range(8):
             qval = q[i//2][:, :16] if i % 2 == 0 else q[i//2][:, 16:]
-            vals.append(d * scales[i+scales_idx] * qval)
+            vals.append(d * scales[:, i+scales_idx:i+scales_idx+1] * qval)
 
     y = np.concatenate(vals, axis=1).reshape(shape)
     return Tensor(y).T
 
 def load_gguf_tokenizer(fn: str):
+  # TODO: is the tokenizer correct?
   reader = gguf.GGUFReader(fn, 'r')
   tokens = [str(bytes(reader.fields['tokenizer.ggml.tokens'].parts[idx]), encoding="utf-8") for idx in reader.fields['tokenizer.ggml.tokens'].data]
   scores = [pv for idx in reader.fields['tokenizer.ggml.scores'].data for pv in reader.fields['tokenizer.ggml.scores'].parts[idx].tolist()]
@@ -277,11 +305,11 @@ class LLaMa:
   @staticmethod
   def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=False):
     params = MODEL_PARAMS[model_gen][model_size]
-    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path)) if model_gen != 'GGUF' else load_gguf_tokenizer(model_path)
-    assert sp_model.vocab_size() == params["args"]["vocab_size"], f"{sp_model.vocab_size()=} not equal to {params['args']['vocab_size']}"
+    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path)) # if model_gen != 'GGUF' else load_gguf_tokenizer(model_path)
+    # assert sp_model.vocab_size() == params["args"]["vocab_size"], f"{sp_model.vocab_size()=} not equal to {params['args']['vocab_size']}"
 
     jit = bool(getenv("JIT", 1))
-    model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear, max_context=MAX_CONTEXT, jit=jit) if quantize else Transformer(**params["args"], max_context=MAX_CONTEXT, jit=jit)
+    model = Transformer(**params["args"], linear=QK4_0Linear, max_context=MAX_CONTEXT, jit=jit) if quantize else Transformer(**params["args"], max_context=MAX_CONTEXT, jit=jit)
     if model_gen == 'GGUF':
       weights = load_gguf_weights(model_path)
     else:
@@ -296,7 +324,7 @@ class LLaMa:
     weights = {k:v.to(Device.DEFAULT).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
 
     if quantize:
-      weights = AbsmaxQuantizedLinear.quantize(weights)
+      weights = QK4_0Linear.quantize(weights)
       for _,v in weights.items(): v.realize()
     load_state_dict(model, weights, strict=False)
 
